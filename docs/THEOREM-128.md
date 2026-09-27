@@ -11,7 +11,7 @@ and [lean/VERIFICATION.txt](../lean/VERIFICATION.txt).
 
 ## Statement
 
-Let `q = 2^128`, `W = 32` (words per 512-byte block), and let L be an
+Let `Q = 2^128`, `W = 32` (words per 512-byte block), and let L be an
 integer with `1 <= L <= 2^61-1`. Fix two distinct byte strings m, m', each
 at most 8L bytes long, independently of the key. The key is 128 uniformly
 random bytes. Then
@@ -55,8 +55,8 @@ d(L) = 1                       if L <= 16
 These are certificates (upper bounds). At L = 1 the bound is attained: the
 one-byte messages `"\x00"` and `"\x01"` differ before the finalizer by `s^2`,
 which vanishes only at `s = 0`, and the empty message and `"\x00"` differ by
-`y + s^3`; either pair collides with probability exactly `(2q - 1)/q^2`,
-`q = 2^128`, so the score of 127 bits is exact. For larger L the numerators
+`y + s^3`; either pair collides with probability exactly `(2Q - 1)/Q^2`,
+`Q = 2^128`, so the score of 127 bits is exact. For larger L the numerators
 are not claimed to be attained. The SplitMix64 seed constructor is a different key distribution and
 the bound is not asserted for it.
 
@@ -104,19 +104,19 @@ preceding regions since all regions share the key table.
 **2. Level 2, equal lengths.** Conditional on level-1 keys with a differing
 block, the Horner difference is a nonzero polynomial in the independent
 uniform y of degree at most `p-1`; pre-final collision probability at most
-`(d + p - 1)/q`.
+`(d + p - 1)/Q`.
 
 **3. Unequal lengths.** The coefficient of `y^max(p,p')` is `ell XOR ell'`
-(equal block counts; distinct lengths below `2^64 < q` have distinct field
+(equal block counts; distinct lengths below `2^64 < Q` have distinct field
 representations) or the byte length of the message with more blocks
-(nonzero): at most `max(p,p')/q`, with no exceptional level-1 key and no
+(nonzero): at most `max(p,p')/Q`, with no exceptional level-1 key and no
 dependence on s.
 
 **4. Twist and finalizer.** Integer addition modulo `2^128` (with the limb
 carry) is a bijection for fixed tau; the five circuit parameters are in
 bijection with the lower coefficients of a uniform monic quintic over any
 characteristic-two field, so the finalizer adds exactly
-`(1 - alpha)/q <= 1/q`. Numerators: `d + p` (equal lengths) and
+`(1 - alpha)/Q <= 1/Q`. Numerators: `d + p` (equal lengths) and
 `max(p,p') + 1` (unequal), both within `p(L) + d(L)`.
 
 ## Formalization
