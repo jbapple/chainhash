@@ -97,19 +97,37 @@ static inline int ch128_detect(void) {
     if(!__get_cpuid_count(7,0,&a,&b,&c,&d) || !(b&(1u<<5)) || !(c&(1u<<10))) return 1;
     return (l&0xe6)==0xe6 && (b&(1u<<16)) ? 3:2;
 }
-#elif !defined(CHAINHASH128_PORTABLE) && defined(__aarch64__) && !defined(__AARCH64EB__) && (defined(__ARM_FEATURE_AES) || defined(__ARM_FEATURE_CRYPTO))
+#elif !defined(CHAINHASH128_PORTABLE) && defined(__aarch64__) && !defined(__AARCH64EB__) && (defined(__GNUC__) || defined(__clang__))
 #define CH128_ARM 1
 #include <arm_neon.h>
-/* EOR3 is FEAT_SHA3 (optional from ARMv8.2): it is emitted only when the target
- * guarantees it (CH128_SHA3 1) or, otherwise, when the CPU reports it at run time
- * (CH128_SHA3 2: Linux HWCAP, Apple sysctl; other systems count it as absent).
- * Define CHAINHASH128_NO_SHA3 to force the EOR-only kernels. Same digest either way. */
+/* PMULL (FEAT_PMULL) and EOR3 (FEAT_SHA3, optional from ARMv8.2) are optional.
+ * Each is used unconditionally when the target guarantees it (CH128_PMULL,
+ * CH128_SHA3 1) and otherwise only when the CPU reports it at run time (2).
+ * Without compile-time PMULL the NEON code carries a target attribute
+ * (CH128_NBEGIN/CH128_NEND) and the backend is NEON only on a CPU with PMULL.
+ * Define CHAINHASH128_NO_SHA3 to force the EOR-only kernels. Same digest always. */
+#if defined(__ARM_FEATURE_AES) || defined(__ARM_FEATURE_CRYPTO)
+#define CH128_PMULL 1
+#define CH128_NBEGIN
+#define CH128_NEND
+#else
+#define CH128_PMULL 2
+#ifdef __clang__
+#define CH128_NBEGIN _Pragma("clang attribute push(__attribute__((target(\"aes\"))),apply_to=function)")
+#define CH128_NEND _Pragma("clang attribute pop")
+#else
+#define CH128_NBEGIN _Pragma("GCC push_options") _Pragma("GCC target(\"+crypto\")")
+#define CH128_NEND _Pragma("GCC pop_options")
+#endif
+#endif
 #if defined(CHAINHASH128_NO_SHA3)
 #define CH128_SHA3 0
 #elif defined(__ARM_FEATURE_SHA3)
 #define CH128_SHA3 1
 #else
 #define CH128_SHA3 2
+#endif
+#if CH128_PMULL == 2 || CH128_SHA3 == 2
 #if defined(__linux__)
 #include <sys/auxv.h>
 #elif defined(__APPLE__)
@@ -119,25 +137,24 @@ extern "C"
 #endif
 int sysctlbyname(const char *,void *,size_t *,void *,size_t);
 #endif
-static inline int ch128_sha3_detect(void) {
+/* 1 if the CPU has an extension: Linux AT_HWCAP bit (PMULL 1<<4, SHA3 1<<17);
+ * Apple sysctl, then the older name, then dflt. Other systems report absent. */
+static inline int ch128_arm_has(unsigned long hwcap,const char *feat,const char *old,int dflt) {
 #if defined(__linux__)
-#ifdef HWCAP_SHA3
-    return (getauxval(AT_HWCAP)&HWCAP_SHA3)!=0;
-#else
-    return (getauxval(AT_HWCAP)&(1ul<<17))!=0;
-#endif
+    (void)feat; (void)old; (void)dflt; return (getauxval(AT_HWCAP)&hwcap)!=0;
 #elif defined(__APPLE__)
-    int v=0; size_t n=sizeof(v);
-    if(sysctlbyname("hw.optional.arm.FEAT_SHA3",&v,&n,NULL,0)!=0) { v=0; n=sizeof(v); if(sysctlbyname("hw.optional.armv8_2_sha3",&v,&n,NULL,0)!=0) v=0; }
-    return v!=0;
+    int v=0; size_t n=sizeof(v); (void)hwcap;
+    if(sysctlbyname(feat,&v,&n,NULL,0)==0) return v!=0;
+    v=0; n=sizeof(v); if(old && sysctlbyname(old,&v,&n,NULL,0)==0) return v!=0;
+    return dflt;
 #else
-    return 0;
+    (void)hwcap; (void)feat; (void)old; (void)dflt; return 0;
 #endif
 }
 #endif
 static inline int ch128_has_sha3(void) {
 #if CH128_SHA3 == 2
-    static int cache=-1; int v=__atomic_load_n(&cache,__ATOMIC_RELAXED); if(v<0) { v=ch128_sha3_detect(); __atomic_store_n(&cache,v,__ATOMIC_RELAXED); } return v;
+    static int cache=-1; int v=__atomic_load_n(&cache,__ATOMIC_RELAXED); if(v<0) { v=ch128_arm_has(1ul<<17,"hw.optional.arm.FEAT_SHA3","hw.optional.armv8_2_sha3",0); __atomic_store_n(&cache,v,__ATOMIC_RELAXED); } return v;
 #else
     return CH128_SHA3;
 #endif
@@ -147,7 +164,11 @@ static inline int chainhash128_backend(void) {
 #ifdef CH128_X86
     static int cache=-1; int v=__atomic_load_n(&cache,__ATOMIC_RELAXED); if(v<0) { v=ch128_detect(); __atomic_store_n(&cache,v,__ATOMIC_RELAXED); } return v;
 #elif defined(CH128_ARM)
+#if CH128_PMULL == 2
+    static int cache=-1; int v=__atomic_load_n(&cache,__ATOMIC_RELAXED); if(v<0) { v=ch128_arm_has(1ul<<4,"hw.optional.arm.FEAT_PMULL",NULL,1)?CH128_NEON:0; __atomic_store_n(&cache,v,__ATOMIC_RELAXED); } return v;
+#else
     return CH128_NEON;
+#endif
 #else
     return 0;
 #endif
@@ -270,6 +291,7 @@ CH128_XIN(ch128_512,CH128_T512,4)
 #endif
 
 #ifdef CH128_ARM
+CH128_NBEGIN
 static inline uint64x2_t ch128_nld(const void *p) { uint64x2_t a; __asm__("ld1 {%0.2d}, [%1]":"=w"(a):"r"(p),"m"(*(const uint8_t (*)[16])p)); return a; }
 static inline uint64x2_t ch128_n_ll(uint64x2_t a,uint64x2_t b) { uint64x2_t r; __asm__("pmull %0.1q, %1.1d, %2.1d":"=w"(r):"w"(a),"w"(b)); return r; }
 static inline uint64x2_t ch128_n_hh(uint64x2_t a,uint64x2_t b) { uint64x2_t r; __asm__("pmull2 %0.1q, %1.2d, %2.2d":"=w"(r):"w"(a),"w"(b)); return r; }
@@ -300,6 +322,7 @@ static inline ch128_n_raw ch128_n_prod(uint64x2_t a,uint64x2_t b,int school) { r
 static inline ch128_raw ch128_n_wordprod(ch128_word a,ch128_word b,int school) {
     ch128_raw r; ch128_n_raw v=ch128_n_prod(ch128_n_load(&a),ch128_n_load(&b),school); ch128_n_store(&r.lo,v.lo); ch128_n_store(&r.hi,v.hi); return r;
 }
+CH128_NEND
 #endif
 
 static inline ch128_raw ch128_prod(ch128_word a,ch128_word b,int backend,int school) {
@@ -380,6 +403,7 @@ CH128_T128 static inline ch128_word ch128_128_short(const chainhash128_key *k,co
 }
 #endif
 #ifdef CH128_ARM
+CH128_NBEGIN
 static inline uint64x2_t ch128_n_reduce(ch128_n_raw p) {
     const ch128_word rw={0x87,0}; uint64x2_t r=ch128_n_load(&rw);
     uint64x2_t a=ch128_n_ll(p.hi,r),b=ch128_n_hl(p.hi,r);
@@ -415,6 +439,7 @@ static inline ch128_word ch128_n_short(const chainhash128_key *k,const uint8_t *
         state=ch128_n_reduce(ch128_n_pack(a,0));
     }return ch128_n_finish(k,state);
 }
+CH128_NEND
 #endif
 #ifdef CH128_X86
 CH128_T128 static inline ch128_word ch128_128_finish_word(const chainhash128_key *k,ch128_word v) { return ch128_128_finish(k,ch128_128_load(&v)); }
@@ -1162,6 +1187,7 @@ CH128_T512 static ch128_word ch128_512_pf(const chainhash128_key *k,const uint8_
 #endif
 
 #ifdef CH128_ARM
+CH128_NBEGIN
 static void ch128_n_region(const chainhash128_key *k,const uint8_t *p,ch128_raw out[8],int school) {
     unsigned j,c; for(j=0;j<8;j+=1) { ch128_n_acc a=ch128_n_azero(); ch128_n_raw r;
         for(c=0;c<CH128_CHUNKS;c++) a=ch128_n_accum(a,ch128_n_xor(ch128_n_load(p+256*c+16*j),ch128_n_bc(k->ph+2*c)),ch128_n_xor(ch128_n_load(p+256*c+16*j+128),ch128_n_bc(k->ph+2*c+1)),school);
@@ -1722,6 +1748,7 @@ static inline ch128_word ch128_n_bulk1(const chainhash128_key *k,const uint8_t *
 #undef CH128_NE3B
 #undef CH128_NBULK1
 
+CH128_NEND
 #endif
 
 static inline void ch128_region(const chainhash128_key *k,const uint8_t *p,size_t n,ch128_raw out[8],int b,int school) {
@@ -1846,6 +1873,7 @@ CH128_XTAIL(ch128_512,CH128_T512,4)
 #undef CH128_XTAIL
 #endif
 #ifdef CH128_ARM
+CH128_NBEGIN
 /* Evaluate a partial comb region in vector registers. Only the final 256-byte
  * chunk needs padding; skip absent first words so no key-only pairs are added.
  * The cached powers combine the independent lanes without a serial Horner chain. */
@@ -1872,6 +1900,7 @@ static inline ch128_word ch128_n_tail(const chainhash128_key *k,const uint8_t *p
       ch128_n_store(&v,ch128_n_reduce(r)); }
     return v;
 }
+CH128_NEND
 #endif
 static inline ch128_word ch128_hash(const chainhash128_key *k,const void *data,size_t len,int b,int school,int hint,unsigned step,size_t dist) {
     const uint8_t *p=(const uint8_t *)data; size_t full=len/CH128_REGION,n=len%CH128_REGION; ch128_word v=ch128_make(len,0);

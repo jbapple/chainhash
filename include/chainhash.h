@@ -84,9 +84,52 @@ static inline int ch_detect(void) {
 CH_T128 static inline ch_raw ch_hwprod(uint64_t a,uint64_t b) {
     ch_raw r; __m128i v=_mm_clmulepi64_si128(_mm_set_epi64x(0,(long long)a),_mm_set_epi64x(0,(long long)b),0); _mm_storeu_si128((__m128i_u *)&r,v); return r;
 }
-#elif !defined(CHAINHASH_PORTABLE) && defined(__aarch64__) && !defined(__AARCH64EB__) && (defined(__ARM_FEATURE_AES) || defined(__ARM_FEATURE_CRYPTO))
+#elif !defined(CHAINHASH_PORTABLE) && defined(__aarch64__) && !defined(__AARCH64EB__) && (defined(__GNUC__) || defined(__clang__))
 #define CH_ARM 1
 #include <arm_neon.h>
+/* PMULL (FEAT_PMULL) is optional: without it at compile time the NEON code carries a
+ * target attribute (CH_NBEGIN/CH_NEND) and the backend is NEON only on a CPU that
+ * reports PMULL at run time (Linux HWCAP, Apple sysctl), portable otherwise. */
+#if defined(__ARM_FEATURE_AES) || defined(__ARM_FEATURE_CRYPTO)
+#define CH_PMULL 1
+#define CH_NBEGIN
+#define CH_NEND
+#else
+#define CH_PMULL 2
+#ifdef __clang__
+#define CH_NBEGIN _Pragma("clang attribute push(__attribute__((target(\"aes\"))),apply_to=function)")
+#define CH_NEND _Pragma("clang attribute pop")
+#else
+#define CH_NBEGIN _Pragma("GCC push_options") _Pragma("GCC target(\"+crypto\")")
+#define CH_NEND _Pragma("GCC pop_options")
+#endif
+#endif
+#if CH_PMULL == 2
+#if defined(__linux__)
+#include <sys/auxv.h>
+#elif defined(__APPLE__)
+/* Declared here: <sys/sysctl.h> does not compile under strict _POSIX_C_SOURCE. */
+#ifdef __cplusplus
+extern "C"
+#endif
+int sysctlbyname(const char *,void *,size_t *,void *,size_t);
+#endif
+/* 1 if the CPU has an extension: Linux AT_HWCAP bit (PMULL 1<<4, SHA3 1<<17);
+ * Apple sysctl, then the older name, then dflt. Other systems report absent. */
+static inline int ch_arm_has(unsigned long hwcap,const char *feat,const char *old,int dflt) {
+#if defined(__linux__)
+    (void)feat; (void)old; (void)dflt; return (getauxval(AT_HWCAP)&hwcap)!=0;
+#elif defined(__APPLE__)
+    int v=0; size_t n=sizeof(v); (void)hwcap;
+    if(sysctlbyname(feat,&v,&n,NULL,0)==0) return v!=0;
+    v=0; n=sizeof(v); if(old && sysctlbyname(old,&v,&n,NULL,0)==0) return v!=0;
+    return dflt;
+#else
+    (void)hwcap; (void)feat; (void)old; (void)dflt; return 0;
+#endif
+}
+#endif
+CH_NBEGIN
 static inline uint64x2_t ch_ll(uint64x2_t a,uint64x2_t b) { uint64x2_t r; __asm__("pmull %0.1q, %1.1d, %2.1d":"=w"(r):"w"(a),"w"(b)); return r; }
 static inline uint64x2_t ch_hh(uint64x2_t a,uint64x2_t b) { uint64x2_t r; __asm__("pmull2 %0.1q, %1.2d, %2.2d":"=w"(r):"w"(a),"w"(b)); return r; }
 static inline uint64x2_t ch_xor3(uint64x2_t a,uint64x2_t b,uint64x2_t c) {
@@ -97,12 +140,17 @@ static inline uint64x2_t ch_xor3(uint64x2_t a,uint64x2_t b,uint64x2_t c) {
 #endif
 }
 static inline ch_raw ch_hwprod(uint64_t a,uint64_t b) { ch_raw r; vst1q_u64(&r.lo,ch_ll(vcombine_u64(vcreate_u64(a),vcreate_u64(0)),vcombine_u64(vcreate_u64(b),vcreate_u64(0)))); return r; }
+CH_NEND
 #endif
 static inline int chainhash_backend(void) {
 #ifdef CH_X86
     static int cache=-1; int v=__atomic_load_n(&cache,__ATOMIC_RELAXED); if(v<0) { v=ch_detect(); __atomic_store_n(&cache,v,__ATOMIC_RELAXED); } return v;
 #elif defined(CH_ARM)
+#if CH_PMULL == 2
+    static int cache=-1; int v=__atomic_load_n(&cache,__ATOMIC_RELAXED); if(v<0) { v=ch_arm_has(1ul<<4,"hw.optional.arm.FEAT_PMULL",NULL,1)?CH_NEON:0; __atomic_store_n(&cache,v,__ATOMIC_RELAXED); } return v;
+#else
     return CH_NEON;
+#endif
 #else
     return 0;
 #endif
@@ -162,6 +210,7 @@ CH_T128 static uint64_t ch_fastfinish(const chainhash_key *k,uint64_t v) {
     return ch_lane0(r)^k->c[4];
 }
 #elif defined(CH_ARM)
+CH_NBEGIN
 static inline uint64x2_t ch_vreduce(uint64x2_t a) { const uint64x2_t r=vdupq_n_u64(27); uint64x2_t t=ch_hh(a,r); return ch_xor3(a,t,ch_hh(t,r)); }
 static inline uint64x2_t ch_v64(uint64_t v) { return vcombine_u64(vcreate_u64(v),vcreate_u64(0)); }
 static inline uint64x2_t ch_ld(const uint8_t *p) { return vreinterpretq_u64_u8(vld1q_u8(p)); }
@@ -201,6 +250,7 @@ static uint64_t ch_tail_neon(const chainhash_key *k,const uint8_t *p,size_t n,ui
     }
     return ch_finish_neon_vec(k,ch_vreduce(acc));
 }
+CH_NEND
 #endif
 static inline uint64_t ch_finish(const chainhash_key *k,uint64_t v,int b) {
 #if defined(CH_X86) || defined(CH_ARM)
@@ -484,6 +534,7 @@ CH_T512 static uint64_t ch_bulk512_pf(const chainhash_key *k,const uint8_t *p,si
 #endif
 
 #ifdef CH_ARM
+CH_NBEGIN
 static inline void ch_region_neon(const chainhash_key *k,const uint8_t *p,ch_raw out[4]) {
     unsigned j; for(j=0;j<4;j++) { uint64x2_t s=vdupq_n_u64(0);
     { uint64x2_t a=veorq_u64(ch_ld(p+0+16*j),vld1q_u64(k->ph+0)), b=veorq_u64(ch_ld(p+64+16*j),vld1q_u64(k->ph+2)); s=ch_xor3(s,ch_ll(a,b),ch_hh(a,b)); }
@@ -559,6 +610,7 @@ CH_INLINE uint64_t ch_bulk_neon_run(const chainhash_key *k,const uint8_t *p,size
 }
 static uint64_t ch_bulk_neon(const chainhash_key *k,const uint8_t *p,size_t regions,size_t len,ch_raw *st) { return ch_bulk_neon_run(k,p,regions,len,st,CH_PF_OFF,64,0); }
 static uint64_t ch_bulk_neon_pf(const chainhash_key *k,const uint8_t *p,size_t regions,size_t len,ch_raw *st,int hint,unsigned step,size_t dist) { CH_PF_SWITCH(ch_bulk_neon,k,p,regions,len,st) }
+CH_NEND
 #endif
 static inline void ch_region(const chainhash_key *k,const uint8_t *p,size_t n,ch_raw out[4],int b) {
     if(n==1024) {
