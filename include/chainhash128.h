@@ -191,6 +191,24 @@ static inline int chainhash128_backend(void) {
 #endif
 }
 static inline int chainhash128_has_backend(int b) { int h=chainhash128_backend(); return b==0 || (h==4 ? b==4 : b>0 && b<=h); }
+/* Default product method per backend (both give the same digest). Schoolbook where the
+ * PCLMUL port also executes the Karatsuba shuffles and issues a product every cycle:
+ * Intel Broadwell and later (detected by ADX) on XMM, ZMM, and NEON. Karatsuba on YMM and
+ * on other XMM cores, where PCLMULQDQ issues once per two (AMD, Haswell) to eight (Sandy
+ * and Ivy Bridge) cycles while shuffles and XORs use other pipes (uops.info). */
+static inline int ch128_pclmul_fast(void) {
+#ifdef CH128_X86
+    static int cache=-1; int v=__atomic_load_n(&cache,__ATOMIC_RELAXED);
+    if(v<0) { unsigned r[4],m; ch128_cpuid(0,0,r); m=r[0];
+        v=r[1]==0x756e6547u && r[3]==0x49656e69u && r[2]==0x6c65746eu;
+        if(v) { if(m>=7) { ch128_cpuid(7,0,r); v=(r[1]>>19)&1; } else v=0; }
+        __atomic_store_n(&cache,v,__ATOMIC_RELAXED); }
+    return v;
+#else
+    return 1;
+#endif
+}
+static inline int ch128_school(int b) { return b==CH128_XMM ? ch128_pclmul_fast() : b==CH128_ZMM || b==CH128_NEON; }
 /* Software prefetch in the x86 bulk kernels, as in chainhash.h: hint CH_PF_T0/T1/NTA
  * every step bytes of the region dist bytes ahead, formed only inside the input; no
  * setting changes a digest. The pinned NEON kernels take no hints (compute-bound). */
@@ -559,6 +577,7 @@ CH128_T128 CH128_INLINE ch128_word ch128_128_bulk1_run(const chainhash128_key *k
 CH128_T128 static ch128_word ch128_128_bulk0(const chainhash128_key *k,const uint8_t *p,size_t regions,size_t len,ch128_raw *st) { return ch128_128_bulk0_run(k,p,regions,len,st,CH_PF_OFF,64,0); }
 CH128_T128 static ch128_word ch128_128_bulk1(const chainhash128_key *k,const uint8_t *p,size_t regions,size_t len,ch128_raw *st) { return ch128_128_bulk1_run(k,p,regions,len,st,CH_PF_OFF,64,0); }
 CH128_T128 static ch128_word ch128_128_pf(const chainhash128_key *k,const uint8_t *p,size_t regions,size_t len,ch128_raw *st,int hint,unsigned step,size_t dist) { CH128_PF_SWITCH(ch128_128_bulk1,k,p,regions,len,st) }
+CH128_T128 static ch128_word ch128_128_pfk(const chainhash128_key *k,const uint8_t *p,size_t regions,size_t len,ch128_raw *st,int hint,unsigned step,size_t dist) { CH128_PF_SWITCH(ch128_128_bulk0,k,p,regions,len,st) }
 #endif
 
 #ifdef CH128_X86
@@ -1739,7 +1758,7 @@ static inline ch128_word ch128_hash(const chainhash128_key *k,const void *data,s
 #ifdef CH128_X86
         if(b==3) v=hint?ch128_512_pf(k,p,full,len,0,hint,step,dist):school?ch128_512_bulk1(k,p,full,len,0):ch128_512_bulk0(k,p,full,len,0);
         else if(b==2) v=hint?ch128_256_pf(k,p,full,len,0,hint,step,dist):school?ch128_256_bulk1(k,p,full,len,0):ch128_256_bulk0(k,p,full,len,0);
-        else if(b==1) v=hint?ch128_128_pf(k,p,full,len,0,hint,step,dist):school?ch128_128_bulk1(k,p,full,len,0):ch128_128_bulk0(k,p,full,len,0);
+        else if(b==1) v=hint?(school?ch128_128_pf(k,p,full,len,0,hint,step,dist):ch128_128_pfk(k,p,full,len,0,hint,step,dist)):school?ch128_128_bulk1(k,p,full,len,0):ch128_128_bulk0(k,p,full,len,0);
         else return chainhash128_evaluate(k,data,len,8,1,b,school);
 #elif defined(CH128_ARM)
         if(b==4) v=school?ch128_n_bulk1(k,p,full,len,0):ch128_n_bulk0(k,p,full,len,0);
@@ -1763,7 +1782,7 @@ static inline ch128_word ch128_hash(const chainhash128_key *k,const void *data,s
     return ch128_finish(k,v,b);
 }
 static inline ch128_word chainhash128_with_backend(const chainhash128_key *k,const void *data,size_t len,int b,int school) { return ch128_hash(k,data,len,b,school,CH_PF_OFF,64,0); }
-static inline ch128_word chainhash128(const chainhash128_key *k,const void *p,size_t n) { int b=chainhash128_backend(); return chainhash128_with_backend(k,p,n,b,b==CH128_XMM || b==CH128_ZMM || b==CH128_NEON); }
+static inline ch128_word chainhash128(const chainhash128_key *k,const void *p,size_t n) { int b=chainhash128_backend(); return chainhash128_with_backend(k,p,n,b,ch128_school(b)); }
 /* chainhash128() with an explicit backend and software prefetch (CH_PF_*, every
  * step = 64 or 128 bytes, dist bytes ahead; x86 only), with the backend's default
  * product method. An unavailable backend falls back to the detected one. The digest
@@ -1773,7 +1792,7 @@ static inline ch128_word chainhash128_with_prefetch(const chainhash128_key *k,co
 #ifndef CH128_X86
     hint=CH_PF_OFF;
 #endif
-    return ch128_hash(k,data,len,b,b==CH128_XMM || b==CH128_ZMM || b==CH128_NEON,hint>=CH_PF_T0 && hint<=CH_PF_NTA ? hint : CH_PF_OFF,step,dist);
+    return ch128_hash(k,data,len,b,ch128_school(b),hint>=CH_PF_T0 && hint<=CH_PF_NTA ? hint : CH_PF_OFF,step,dist);
 }
 static inline int chainhash128_selftest(void) {
     uint8_t m[CH128_REGION+1]; size_t n; chainhash128_key k=chainhash128_key_from_seed(123);
