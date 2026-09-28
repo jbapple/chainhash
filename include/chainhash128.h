@@ -287,14 +287,21 @@ CH128_T128 static inline ch128_word ch128_128_finish(const chainhash128_key *k,_
  * V = n*y^p + kb * Horner_y(w0+ka,...,w_(p-1)+ka). */
 /* All partner words are absent through 128 bytes. Factor their common key
  * out of the Horner polynomial; the result is identical to separate blocks. */
+/* Stride-4 Horner: four independent chains advanced by y^4 replace the
+ * depth-(count-1) serial chain (the exact-count k=4 schedule proved
+ * bit-identical by evaluation_independence).  Same V, no re-freeze; helps
+ * count>=4 (65..128 bytes), neutral below.  H = sum A_j y^{count-1-j},
+ * A_j = w_j + kappa[0]; e_c = (count-1-c) mod 4 realigns each chain. */
 CH128_T128 static inline ch128_word ch128_128_short(const chainhash128_key *k,const uint8_t *p,size_t n) {
-    unsigned j,count=n?(unsigned)((n+15)/16):0; __m128i state=ch128_128_zero();
+    unsigned count=n?(unsigned)((n+15)/16):0,c,idx; __m128i state=ch128_128_zero();
     if(count) {
-        ch128_word w=ch128_partial(p,n,0),length={n,n};
-        __m128i ka=ch128_128_load(k->ph),y=ch128_128_load(k->yp+1),yp,lv,l,m; ch128_128_acc a;
-        state=ch128_128_xor(ch128_128_load(&w),ka);
-        for(j=1;j<count;j++) {w=ch128_partial(p,n,16*j);state=ch128_128_xor(ch128_128_mul(state,y),ch128_128_xor(ch128_128_load(&w),ka));}
-        a=ch128_128_accum(ch128_128_azero(),state,ch128_128_load(k->ph+1),0);
+        ch128_word length={n,n};
+        __m128i ka=ch128_128_load(k->ph),y4=ch128_128_load(k->yp+4),yp,lv,l,m,R[4],H; ch128_128_acc a;
+        for(c=0;c<4 && c<count;c++){ ch128_word w=ch128_partial(p,n,16*c); R[c]=ch128_128_xor(ch128_128_load(&w),ka); }
+        for(c=0;c<4;c++) for(idx=c+4; idx<count; idx+=4){ ch128_word w=ch128_partial(p,n,16*idx); R[c]=ch128_128_xor(ch128_128_mul(R[c],y4),ch128_128_xor(ch128_128_load(&w),ka)); }
+        H=ch128_128_zero();
+        for(c=0;c<4 && c<count;c++){ unsigned e=(count-1-c)&3; H=ch128_128_xor(H,e?ch128_128_mul(R[c],ch128_128_load(k->yp+e)):R[c]); }
+        a=ch128_128_accum(ch128_128_azero(),H,ch128_128_load(k->ph+1),0);
         yp=ch128_128_load(k->yp+count);lv=ch128_128_load(&length);
         l=ch128_128_ll(yp,lv);m=ch128_128_hh(yp,lv);
         a.l=ch128_128_xor(a.l,l);a.m=ch128_128_xor(a.m,ch128_128_xor(l,m));
@@ -322,13 +329,15 @@ static inline ch128_word ch128_n_finish(const chainhash128_key *k,uint64x2_t vv)
 /* For n<=128 every comb partner is absent. Factor its common key kb:
  * V = n*y^p + kb * Horner_y(w0+ka,...,w_(p-1)+ka). */
 static inline ch128_word ch128_n_short(const chainhash128_key *k,const uint8_t *p,size_t n) {
-    unsigned j,count=n?(unsigned)((n+15)/16):0; uint64x2_t state=ch128_n_zero();
+    unsigned count=n?(unsigned)((n+15)/16):0,c,idx; uint64x2_t state=ch128_n_zero();
     if(count) {
-        ch128_word w=ch128_partial(p,n,0),length={n,n};
-        uint64x2_t ka=ch128_n_load(k->ph),y=ch128_n_load(k->yp+1),yp,lv,l,m; ch128_n_acc a;
-        state=ch128_n_xor(ch128_n_load(&w),ka);
-        for(j=1;j<count;j++) {w=ch128_partial(p,n,16*j);state=ch128_n_xor(ch128_n_mul(state,y),ch128_n_xor(ch128_n_load(&w),ka));}
-        a=ch128_n_accum(ch128_n_azero(),state,ch128_n_load(k->ph+1),0);
+        ch128_word length={n,n};
+        uint64x2_t ka=ch128_n_load(k->ph),y4=ch128_n_load(k->yp+4),yp,lv,l,m,R[4],H; ch128_n_acc a;
+        for(c=0;c<4 && c<count;c++){ ch128_word w=ch128_partial(p,n,16*c); R[c]=ch128_n_xor(ch128_n_load(&w),ka); }
+        for(c=0;c<4;c++) for(idx=c+4; idx<count; idx+=4){ ch128_word w=ch128_partial(p,n,16*idx); R[c]=ch128_n_xor(ch128_n_mul(R[c],y4),ch128_n_xor(ch128_n_load(&w),ka)); }
+        H=ch128_n_zero();
+        for(c=0;c<4 && c<count;c++){ unsigned e=(count-1-c)&3; H=ch128_n_xor(H,e?ch128_n_mul(R[c],ch128_n_load(k->yp+e)):R[c]); }
+        a=ch128_n_accum(ch128_n_azero(),H,ch128_n_load(k->ph+1),0);
         yp=ch128_n_load(k->yp+count);lv=ch128_n_load(&length);
         l=ch128_n_ll(yp,lv);m=ch128_n_hh(yp,lv);
         a.l=ch128_n_xor(a.l,l);a.m=ch128_n_xor(a.m,ch128_n_xor(l,m));
