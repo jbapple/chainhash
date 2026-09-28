@@ -186,8 +186,9 @@ gated passes ([results/](results/README.md)). Xeon ticks are invariant-TSC
 reference ticks and M2 cycles are SMHasher3's calibrated estimates, so
 the two columns are not comparable with each other. Short inputs are not
 where ChainHash shines: below a few hundred bytes the fixed cost of the
-tail, the lane fold and the finalizer dominates (about 155 Xeon ticks per
-hash for 1–31-byte inputs, against 29 for XXH3-64).
+tail, the lane fold and the finalizer dominates (about 80 Xeon ticks per
+hash for 1–31-byte inputs, against 29 for XXH3-64;
+[x86-xmm-and-amd.md](results/design/x86-xmm-and-amd.md)).
 
 ## Verification
 

@@ -138,11 +138,13 @@ used here with the integer polynomial bit convention). A 512-byte block of
 count at 32, so the score stays 127 with the short-length refinement
 `d(L) = 1` through 128 bytes. 128×128 products are built from 64×64
 carry-less multiplies: schoolbook (four products, limbs selected by CLMUL
-immediates) on XMM, ZMM and NEON, Karatsuba (three products plus limb
-folds) on YMM and in the portable evaluator. Both give the same digest;
-the split follows measurements, because on the M2 the loop is issue-bound
-and schoolbook retires fewer instructions, while on YMM Karatsuba is
-faster. Messages of at most 128 bytes have one pair per block with the
+immediates) on XMM where PCLMULQDQ issues every cycle (Intel Broadwell and
+later), on ZMM and on NEON, Karatsuba (three products plus limb folds) on YMM,
+on other XMM cores (AMD; Intel Sandy Bridge to Haswell) and in the portable
+evaluator. Both give the same digest; the split follows measurements,
+because on the M2 the loop is issue-bound and schoolbook retires fewer
+instructions, while on YMM and where PCLMULQDQ issues once per two or more
+cycles Karatsuba is faster. Messages of at most 128 bytes have one pair per block with the
 partner absent, so a shared short kernel factors the common partner key
 out of the Horner sum.
 
@@ -228,7 +230,11 @@ On the M2 the loop is issue-bound, not multiplier-bound:
 Both loops sustain about 4.5 instructions per calibrated cycle, so the
 method with fewer instructions wins although it multiplies more
 ([audit/](../results/128/audit/)). On YMM the measurement goes the other
-way and the dispatch follows it.
+way and the dispatch follows it. The XMM kernel was later rewritten to keep
+at most 15 vector registers live ([x86-xmm-and-amd.md](../results/design/x86-xmm-and-amd.md)):
+on the Xeon it runs at 8.05 (Karatsuba) and 8.25 (schoolbook) B/TSC with
+GCC 11, and on a Zen 4 core at 4.35 against 3.54 B/cycle, so XMM takes
+Karatsuba unless PCLMULQDQ issues every cycle (Intel with ADX).
 
 Apple cores issue a `PMULL`/`PMULL2` followed by an `EOR` into the same
 register as one operation. On Apple targets (`CHAINHASH_NEON_FUSE`) the
@@ -419,6 +425,20 @@ bytes run at 24.75 GB/s (1.03× from 4096), 512 bytes at 7.86 against 1.70,
 and on the Xeon XMM path 4095 bytes at 5.47 against 1.53. The digest is
 unchanged and so is bulk throughput
 ([partial-region.md](../results/design/partial-region.md)).
+
+ChainHash's x86 XMM and YMM backends had no vector tail at all: a partial
+region went word by word through the portable loader with one hardware
+product per pair, 265-295 cycles per 1-31-byte hash on a Zen 4 core with
+GCC 9 and 11, and these are the backends the Zen 2 and Zen+ machines of the
+SMHasher tables run. The x86 tail now follows the NEON one, inputs up to 64
+bytes stay in registers, and the finalizer's reductions are shifts rather
+than dependent PCLMULQDQs, with the last one folded into the final product.
+ZMM uses the same tail up to 64 bytes on AMD, where one 512-bit product
+costs what one 128-bit product does, and up to 768 bytes on Intel. 1-31
+bytes now take
+94 cycles on Zen 4 with GCC and 82 with Clang on every backend, and 76-84
+Xeon ticks; digests and bulk throughput are unchanged
+([x86-xmm-and-amd.md](../results/design/x86-xmm-and-amd.md)).
 
 ## Attribution
 

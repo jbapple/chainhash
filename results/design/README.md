@@ -19,6 +19,7 @@ none is a core-cycle counter, and cross-host ratios are not meaningful.
 | [smhasher-survey.md](smhasher-survey.md) | technique classification, hot-loop counts and the C1/C2 experiments | 2026-09-19 |
 | [partial-region.md](partial-region.md) | ChainHash-128 partial-region tail before and after | 2026-09-19 |
 | [ehc-budget.md](ehc-budget.md) | multiply and XOR budget of an encode-hash-combine block stage; an analysis, not a measurement | 2026-09-19 |
+| [x86-xmm-and-amd.md](x86-xmm-and-amd.md) | the XMM paths the SMHasher machines run (Zen+, Zen 2, Skylake): GCC 9 build, ChainHash x86 tail, ChainHash-128 XMM kernel and short path, Karatsuba on AMD XMM, key expansion; Zen 4 core cycles and Xeon ticks before and after, PCLMULQDQ costs | 2026-09-28 |
 
 The released functions' own measurements are in [results/64](../64/README.md)
 and [results/128](../128/README.md); the records here compare alternatives
