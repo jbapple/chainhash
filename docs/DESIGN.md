@@ -230,6 +230,15 @@ method with fewer instructions wins although it multiplies more
 ([audit/](../results/128/audit/)). On YMM the measurement goes the other
 way and the dispatch follows it.
 
+Apple cores issue a `PMULL`/`PMULL2` followed by an `EOR` into the same
+register as one operation. On Apple targets (`CHAINHASH_NEON_FUSE`) the
+schoolbook loop therefore accumulates every product that way, each
+accumulator taking its products two at a time through one spare register so
+the pinned register layout repeats: 144 products and 206 `EOR` per KiB, no
+`EOR3`, about 245 issue slots against 336. On the M2 Pro that is 16.2 against
+12.6 B/cycle at 1 MiB, and ChainHash (64-bit) goes from 23.9 to 27.7 B/cycle
+with eight fused chains per region.
+
 ### Register widths and dispatch
 
 There is one bulk kernel per width, XMM, YMM and ZMM on x86 and NEON on

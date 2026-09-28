@@ -120,6 +120,17 @@ static inline int ch128_detect(void) {
 #define CH128_NEND _Pragma("GCC pop_options")
 #endif
 #endif
+/* NEON accumulation form: 1 accumulates every product with a PMULL/PMULL2 followed by
+ * an EOR into the product's register, which Apple cores issue as one fused operation;
+ * 0 uses PMULL, PMULL2 and EOR3 (fewer operations on cores that do not fuse the pair).
+ * Default: 1 on Apple targets. Same digest either way. */
+#ifndef CHAINHASH_NEON_FUSE
+#if defined(__APPLE__)
+#define CHAINHASH_NEON_FUSE 1
+#else
+#define CHAINHASH_NEON_FUSE 0
+#endif
+#endif
 #if defined(CHAINHASH128_NO_SHA3)
 #define CH128_SHA3 0
 #elif defined(__ARM_FEATURE_SHA3)
@@ -1604,6 +1615,110 @@ static __attribute__((noinline)) ch128_word ch128_n_bulk0(const chainhash128_key
     if(st) { memcpy(st,state,sizeof(state)); return ch128_make(0,0); }
     for(j=0;j<4;j++) {acc=ch128_rxor(acc,ch128_prod(state[j].lo,k->yp[3-j],4,0));acc=ch128_rxor(acc,ch128_prod(state[j].hi,k->yh[3-j],4,0));}return ch128_reduce(acc);
 }
+#if CHAINHASH_NEON_FUSE
+/* Four fixed lazy chains, schoolbook, every product accumulated by a fused pair:
+ * "pmull vS; eor vS,vS,vACC" (the EOR writes its PMULL's destination right after it,
+ * which Apple cores issue as one operation; it needs no EOR3). Each accumulator
+ * takes its products two at a time through the spare v30 (pmull v30; eor v30,v30,ACC;
+ * pmull ACC; eor ACC,ACC,v30), so every macro instance ends with the same register
+ * layout. The first chunk pair of a pass writes its accumulators (no zeroing), and
+ * the lane's raw state times y^4 is accumulated last, so the state is needed only at
+ * the end of a pass. XOR is associative and commutative: the raw states, and so the
+ * digest, are bit-identical to the unfused kernels. Registers: v0-v7 states,
+ * v8-v19 lane accumulators (ll,hh,mid), v20-v23 words, v24/v25 y^4 and X^128*y^4,
+ * v26-v29 the two chunk key pairs, v30 spare, v31 zero. Only x9 (data) and x11 (key)
+ * are advanced; loads use immediate offsets. */
+#define CH128_NFL(D,A,B,C) "pmull v" #D ".1q,v" #A ".1d,v" #B ".1d\n\teor v" #D ".16b,v" #D ".16b,v" #C ".16b\n\t"
+#define CH128_NFH(D,A,B,C) "pmull2 v" #D ".1q,v" #A ".2d,v" #B ".2d\n\teor v" #D ".16b,v" #D ".16b,v" #C ".16b\n\t"
+#define CH128_NPL(D,A,B,C) "pmull v" #D ".1q,v" #A ".1d,v" #B ".1d\n\t"
+#define CH128_NPH(D,A,B,C) "pmull2 v" #D ".1q,v" #A ".2d,v" #B ".2d\n\t"
+#define CH128_NKEYS2 \
+      "ldr q28,[x11,#0]\n\t" \
+      "ldr q29,[x11,#16]\n\t" \
+      "ldr q26,[x11,#32]\n\t" \
+      "ldr q27,[x11,#48]\n\t"
+/* Lane words of two chunks (A at x9+OaA/ObA, B at x9+OaB/ObB); FL/FH are CH128_NFL/NFH,
+ * or CH128_NPL/NPH to start the accumulators on the first chunk pair of a pass. */
+#define CH128_NPAIR2(FL,FH,OaA,ObA,OaB,ObB,LL,HH,MID) \
+      "ldr q20,[x9,#" #OaA "]\n\t" \
+      "ldr q21,[x9,#" #ObA "]\n\t" \
+      "ldr q22,[x9,#" #OaB "]\n\t" \
+      "ldr q23,[x9,#" #ObB "]\n\t" \
+      "eor v20.16b,v20.16b,v28.16b\n\t" \
+      "eor v21.16b,v21.16b,v29.16b\n\t" \
+      "eor v22.16b,v22.16b,v26.16b\n\t" \
+      "eor v23.16b,v23.16b,v27.16b\n\t" \
+      FL(30,20,21,LL) CH128_NFL(LL,22,23,30) \
+      FH(30,20,21,HH) CH128_NFH(HH,22,23,30) \
+      "ext v21.16b,v21.16b,v21.16b,#8\n\t" \
+      "ext v23.16b,v23.16b,v23.16b,#8\n\t" \
+      FL(30,20,21,MID) CH128_NFH(MID,20,21,30) \
+      CH128_NFL(30,22,23,MID) CH128_NFH(MID,22,23,30)
+#define CH128_NPH1X2(FL,FH) \
+      CH128_NKEYS2 \
+      CH128_NPAIR2(FL,FH,0,128,256,384,8,9,10) \
+      CH128_NPAIR2(FL,FH,16,144,272,400,11,12,13) \
+      CH128_NPAIR2(FL,FH,32,160,288,416,14,15,16) \
+      CH128_NPAIR2(FL,FH,48,176,304,432,17,18,19) \
+      "add x9,x9,#512\n\t" \
+      "add x11,x11,#64\n\t"
+#define CH128_NPH1X2F CH128_NPH1X2(CH128_NFL,CH128_NFH)
+#if CHAINHASH128_BLOCK_BYTES == 512
+#define CH128_NPH1X2HI CH128_NPH1X2F CH128_NPH1X2F CH128_NPH1X2F CH128_NPH1X2F
+#else
+#define CH128_NPH1X2HI
+#endif
+/* Accumulate raw state (SL,SH) times y^4 into the lane, then pack the lane into the state. */
+#define CH128_NFOLDL(SL,SH,LL,HH,MID) \
+      CH128_NFL(30,SL,24,LL) CH128_NFL(LL,SH,25,30) \
+      CH128_NFH(30,SL,24,HH) CH128_NFH(HH,SH,25,30) \
+      CH128_NFL(30,SL,20,MID) CH128_NFH(MID,SL,20,30) \
+      CH128_NFL(30,SH,21,MID) CH128_NFH(MID,SH,21,30) \
+      "ext v30.16b,v31.16b,v" #MID ".16b,#8\n\t" \
+      "eor v" #SL ".16b,v" #LL ".16b,v30.16b\n\t" \
+      "ext v30.16b,v" #MID ".16b,v31.16b,#8\n\t" \
+      "eor v" #SH ".16b,v" #HH ".16b,v30.16b\n\t"
+#define CH128_NFOLDF \
+      "ext v20.16b,v24.16b,v24.16b,#8\n\t" \
+      "ext v21.16b,v25.16b,v25.16b,#8\n\t" \
+      CH128_NFOLDL(0,1,8,9,10) \
+      CH128_NFOLDL(2,3,11,12,13) \
+      CH128_NFOLDL(4,5,14,15,16) \
+      CH128_NFOLDL(6,7,17,18,19)
+#define CH128_NPASS(OFF) \
+      "add x9,%[p],#" #OFF "\n\t" \
+      "mov x11,%[key]\n\t" \
+      CH128_NPH1X2(CH128_NPL,CH128_NPH) \
+      CH128_NPH1X2F \
+      CH128_NPH1X2F \
+      CH128_NPH1X2F \
+      CH128_NPH1X2HI \
+      CH128_NFOLDF
+static __attribute__((noinline)) ch128_word ch128_n_bulk1(const chainhash128_key *k,const uint8_t *p,size_t regions,size_t len,ch128_raw *st) {
+    ch128_raw state[4],acc={{0,0},{0,0}};uint8_t *out=(uint8_t *)state;unsigned j;
+    if(st) memcpy(state,st,sizeof(state)); else { memset(state,0,sizeof(state)); state[3].lo.lo=len; }
+    __asm__ volatile(
+      "add x9,%[out],#64\n\t"
+      "ld1 {v0.2d,v1.2d,v2.2d,v3.2d},[%[out]]\n\t"
+      "ld1 {v4.2d,v5.2d,v6.2d,v7.2d},[x9]\n\t"
+      "ld1 {v24.2d},[%[yp]]\n\t"
+      "ld1 {v25.2d},[%[yh]]\n\t"
+      "movi v31.2d,#0\n\t"
+      "1:\n\t"
+      CH128_NPASS(0)
+      CH128_NPASS(64)
+      "add %[p],%[p],%[rb]\n\t"
+      "subs %[count],%[count],#1\n\t"
+      "b.ne 1b\n\t"
+      "st1 {v0.2d,v1.2d,v2.2d,v3.2d},[%[out]],#64\n\t"
+      "st1 {v4.2d,v5.2d,v6.2d,v7.2d},[%[out]]\n\t"
+      : [p] "+&r"(p),[count] "+&r"(regions),[out] "+&r"(out)
+      : [key] "r"(k->ph),[yp] "r"(k->yp+4),[yh] "r"(k->yh+4),[rb] "I"(CH128_REGION)
+      : "x9","x11","cc","memory","v0","v1","v2","v3","v4","v5","v6","v7","v8","v9","v10","v11","v12","v13","v14","v15","v16","v17","v18","v19","v20","v21","v22","v23","v24","v25","v26","v27","v28","v29","v30","v31");
+    if(st) { memcpy(st,state,sizeof(state)); return ch128_make(0,0); }
+    for(j=0;j<4;j++) {acc=ch128_rxor(acc,ch128_prod(state[j].lo,k->yp[3-j],4,1));acc=ch128_rxor(acc,ch128_prod(state[j].hi,k->yh[3-j],4,1));}return ch128_reduce(acc);
+}
+#else
 /* Four fixed lazy chains. LD1 lists consume each comb half directly.
  * v0..v7: raw states; v8..v19: three-component block accumulators;
  * v20..v27: four word pairs; v28/v29: keys; v30/v31: scratch.
@@ -1744,6 +1859,7 @@ static inline ch128_word ch128_n_bulk1(const chainhash128_key *k,const uint8_t *
     return ch128_n_bulk1b(k,p,regions,len,st);
 #endif
 }
+#endif
 #undef CH128_NX3
 #undef CH128_NPH0
 #undef CH128_NSTEP0
@@ -1751,10 +1867,18 @@ static inline ch128_word ch128_n_bulk1(const chainhash128_key *k,const uint8_t *
 #undef CH128_NPH1
 #undef CH128_NSTEP1
 #undef CH128_NFOLD1
+#undef CH128_NFL
+#undef CH128_NFH
+#undef CH128_NPL
+#undef CH128_NPH
 #undef CH128_NKEYS2
 #undef CH128_NPAIR2
 #undef CH128_NPH1X2
+#undef CH128_NPH1X2F
 #undef CH128_NPH1X2HI
+#undef CH128_NFOLDL
+#undef CH128_NFOLDF
+#undef CH128_NPASS
 #undef CH128_NE3S
 #undef CH128_NE3B
 #undef CH128_NBULK1

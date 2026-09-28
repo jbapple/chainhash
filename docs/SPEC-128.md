@@ -264,6 +264,9 @@ uses VEX PCLMUL; the wider paths use lane-parallel VPCLMULQDQ.
 
 AArch64 requires crypto instructions enabled at compilation
 (`-march=native+crypto` on Apple, `-march=armv8-a+crypto` generally).
+`CHAINHASH_NEON_FUSE` (default 1 on Apple targets, 0 elsewhere) selects the
+NEON schoolbook kernel that accumulates every product with a fused PMULL+EOR
+pair instead of PMULL/PMULL2/EOR3; the digest is the same.
 PMULL/PMULL2 and the message LD1 loads are pinned by inline assembly. This
 is a compile-time CPU capability contract on ARM, not a Linux HWCAP probe.
 Big-endian ARM and other platforms use portable C. `CHAINHASH128_PORTABLE`
