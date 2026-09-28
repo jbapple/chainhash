@@ -112,6 +112,24 @@ per-ISA entry points `chainhash_xmm/ymm/zmm/neon` exist only for the
   Clang and Apple Clang; `chainhash_selftest()` returns nonzero when the
   header computes its frozen vectors on the host.
 
+### Optional: calibrated prefetch for inputs past L2
+
+`include/chainhash_calibrate.h` tunes how the bulk loop runs, never what
+it computes: per input-size class it picks the backend and a software
+prefetch (hint, step, distance). `chainhash_calibrate(&s, 0)`
+(`chainhash128_calibrate`) measures for about 2 ms of CPU time and fills a
+64-byte schedule to store and reload (`chainhash_schedule_valid` checks it
+was tuned on this CPU); `chainhash_schedule_default(&s)` takes a built-in
+table instead; `make calibrate` prints this machine's schedules as C
+initializers. Hash with `chainhash_with_schedule(&key, data, len, &s)`
+(`chainhash128_with_schedule`). It pays only for inputs larger than L2:
+at 256 MiB ChainHash-128 runs 15-34% faster and ChainHash 4-9% on a Xeon
+Platinum 8375C, and ChainHash 16-18% on an Apple M2 Pro; in cache the
+shipped kernels run unchanged. `chainhash()` and `chainhash128()` are
+unchanged, and the digest never depends on the schedule:
+`test/schedule_knobs.c` and `test/128/schedule_knobs.c` compare every
+reachable one with the bit-serial evaluator.
+
 ## How it works
 
 1. **Blocks: carry-less NH.** The message is read as 64-bit words. Each

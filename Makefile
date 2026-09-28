@@ -24,15 +24,15 @@ TESTS_128 = compile frozen schedule arithmetic vectors edges guard short propert
 BINS = $(addprefix build/64-,$(TESTS))
 BINS_128 = $(addprefix build/128-,$(TESTS_128))
 
-.PHONY: all test test-128 sanitize sanitize-128 vectors speed clean
+.PHONY: all test test-128 sanitize sanitize-128 vectors speed calibrate clean
 all: build/64-compile build/64-cpp build/128-compile build/128-cpp build/speed
 build:
 	mkdir -p build
 
 # ChainHash (64-bit): each test is built natively and with CHAINHASH_PORTABLE.
-build/64-%: test/%.c include/chainhash.h test/property.c | build
+build/64-%: test/%.c include/chainhash.h include/chainhash_calibrate.h test/property.c | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(ARCH_FLAGS) -pthread $< -o $@
-build/64-%-portable: test/%.c include/chainhash.h test/property.c | build
+build/64-%-portable: test/%.c include/chainhash.h include/chainhash_calibrate.h test/property.c | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) -DCHAINHASH_PORTABLE -pthread $< -o $@
 build/64-cpp: test/compile.c include/chainhash.h include/chainhash128.h | build
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(ARCH_FLAGS) -x c++ $< -o $@
@@ -65,9 +65,9 @@ sanitize: | build
 	./build/64-schedule_knobs-sanitize 1500
 
 # ChainHash-128: each test is built natively and with CHAINHASH128_PORTABLE.
-build/128-%: test/128/%.c include/chainhash128.h test/128/oracle.h | build
+build/128-%: test/128/%.c include/chainhash128.h include/chainhash_calibrate.h test/128/oracle.h | build
 	$(CC) $(CPPFLAGS) $(CFLAGS_128) $(ARCH_FLAGS) -pthread $< -o $@
-build/128-%-portable: test/128/%.c include/chainhash128.h test/128/oracle.h | build
+build/128-%-portable: test/128/%.c include/chainhash128.h include/chainhash_calibrate.h test/128/oracle.h | build
 	$(CC) $(CPPFLAGS) $(CFLAGS_128) -DCHAINHASH128_PORTABLE -pthread $< -o $@
 build/128-cpp: test/128/compile.c include/chainhash128.h include/chainhash.h | build
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(ARCH_FLAGS) -x c++ $< -o $@
@@ -110,6 +110,11 @@ vectors: build/64-vectors build/64-vectors-portable build/128-vectors build/128-
 	python3 test/check_vectors.py
 	python3 test/128/check_vectors.py
 
+# Print this CPU's calibrated schedules as C initializers (include/chainhash_calibrate.h).
+build/calibrate: test/calibrate.c include/chainhash_calibrate.h include/chainhash.h include/chainhash128.h | build
+	$(CC) $(CPPFLAGS) $(CFLAGS_128) $(ARCH_FLAGS) $< -o $@
+calibrate: build/calibrate
+	./build/calibrate
 build/speed: test/speed.c include/chainhash.h include/chainhash128.h | build
 	$(CC) $(CPPFLAGS) $(CFLAGS_128) $(ARCH_FLAGS) $< -o $@
 speed: build/speed
