@@ -285,7 +285,18 @@ CH128_T512 static inline ch128_512_acc ch128_512_accum(ch128_512_acc r,__m512i a
     __m512i l=ch128_512_ll(a,b),h=ch128_512_hh(a,b),m;
     if(school) m=_mm512_ternarylogic_epi64(r.m,ch128_512_lh(a,b),ch128_512_hl(a,b),0x96);
     else m=ch128_512_ll(ch128_512_xor(a,ch128_512_swap(a)),ch128_512_xor(b,ch128_512_swap(b)));
-    r.l=ch128_512_xor(r.l,l); r.h=ch128_512_xor(r.h,h); r.m=school?m:ch128_512_xor(r.m,m); return r;
+    r.l=ch128_512_xor(r.l,l); r.h=ch128_512_xor(r.h,h); r.m=school?m:ch128_512_xor(r.m,m); __asm__("" : "+v"(r.l), "+v"(r.h), "+v"(r.m)); return r;
+}
+/* Two products per step, each component folded with one three-input XOR. The volatile
+ * barrier on the accumulators keeps the compiler from regrouping the sums into long-lived
+ * trees and is a scheduling boundary, so no tuning (e.g. Clang -march=znver4) pulls the
+ * next step's loads and products above it and spills them. */
+CH128_T512 static inline ch128_512_acc ch128_512_accum2(ch128_512_acc r,__m512i a,__m512i b,__m512i c,__m512i d,int school) {
+    r.l=_mm512_ternarylogic_epi64(r.l,ch128_512_ll(a,b),ch128_512_ll(c,d),0x96);
+    r.h=_mm512_ternarylogic_epi64(r.h,ch128_512_hh(a,b),ch128_512_hh(c,d),0x96);
+    if(school) r.m=_mm512_ternarylogic_epi64(_mm512_ternarylogic_epi64(r.m,ch128_512_lh(a,b),ch128_512_hl(a,b),0x96),ch128_512_lh(c,d),ch128_512_hl(c,d),0x96);
+    else r.m=_mm512_ternarylogic_epi64(r.m,ch128_512_ll(ch128_512_xor(a,ch128_512_swap(a)),ch128_512_xor(b,ch128_512_swap(b))),ch128_512_ll(ch128_512_xor(c,ch128_512_swap(c)),ch128_512_xor(d,ch128_512_swap(d))),0x96);
+    __asm__ volatile("" : "+v"(r.l), "+v"(r.h), "+v"(r.m)); return r;
 }
 CH128_T512 static inline ch128_512_raw ch128_512_pack(ch128_512_acc a,int school) {
     ch128_512_raw r; if(!school) a.m=ch128_512_xor(a.m,ch128_512_xor(a.l,a.h));
@@ -1099,48 +1110,39 @@ CH128_T512 CH128_INLINE ch128_word ch128_512_bulk0_run(const chainhash128_key *k
     const __m512i y=ch128_512_bc(k->yp+4),h=ch128_512_bc(k->yh+4);
     ch128_512_raw state; ch128_word init[4]={{0,0}}; init[3].lo=len; state.lo=ch128_512_load(init);state.hi=ch128_512_zero();
     if(st) state=ch128_512_in(st);
+    /* The 32 chunk keys, broadcast once per call and read back with plain loads (on Zen 4 a
+     * ZMM broadcast from memory also takes a shuffle slot). The clobber keeps the compiler
+     * from folding the table back into broadcasts; each pass launders the table pointer so
+     * the keys are not hoisted out of the loop and spilled a second time. */
+    __m512i kz[CH128_W]; unsigned c;
+    for(c=0;c<CH128_W;c++) kz[c]=ch128_512_bc(k->ph+c);
+    __asm__ volatile("" : : "r"(kz) : "memory");
     do {
         CH128_PREFETCH(p,regions,CH128_REGION,hint,step,dist);
-      { ch128_512_acc a=ch128_512_azero();
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+0),ch128_512_bc(k->ph+0)),ch128_512_xor(ch128_512_load(p+128),ch128_512_bc(k->ph+1)),0);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+256),ch128_512_bc(k->ph+2)),ch128_512_xor(ch128_512_load(p+384),ch128_512_bc(k->ph+3)),0);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+512),ch128_512_bc(k->ph+4)),ch128_512_xor(ch128_512_load(p+640),ch128_512_bc(k->ph+5)),0);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+768),ch128_512_bc(k->ph+6)),ch128_512_xor(ch128_512_load(p+896),ch128_512_bc(k->ph+7)),0);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+1024),ch128_512_bc(k->ph+8)),ch128_512_xor(ch128_512_load(p+1152),ch128_512_bc(k->ph+9)),0);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+1280),ch128_512_bc(k->ph+10)),ch128_512_xor(ch128_512_load(p+1408),ch128_512_bc(k->ph+11)),0);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+1536),ch128_512_bc(k->ph+12)),ch128_512_xor(ch128_512_load(p+1664),ch128_512_bc(k->ph+13)),0);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+1792),ch128_512_bc(k->ph+14)),ch128_512_xor(ch128_512_load(p+1920),ch128_512_bc(k->ph+15)),0);
+      { ch128_512_acc a=ch128_512_azero(); const __m512i *kt=kz; __asm__ volatile("" : "+r"(kt));
+        a=ch128_512_accum2(a,ch128_512_xor(ch128_512_load(p+0),kt[0]),ch128_512_xor(ch128_512_load(p+128),kt[1]),ch128_512_xor(ch128_512_load(p+256),kt[2]),ch128_512_xor(ch128_512_load(p+384),kt[3]),0);
+        a=ch128_512_accum2(a,ch128_512_xor(ch128_512_load(p+512),kt[4]),ch128_512_xor(ch128_512_load(p+640),kt[5]),ch128_512_xor(ch128_512_load(p+768),kt[6]),ch128_512_xor(ch128_512_load(p+896),kt[7]),0);
+        a=ch128_512_accum2(a,ch128_512_xor(ch128_512_load(p+1024),kt[8]),ch128_512_xor(ch128_512_load(p+1152),kt[9]),ch128_512_xor(ch128_512_load(p+1280),kt[10]),ch128_512_xor(ch128_512_load(p+1408),kt[11]),0);
+        a=ch128_512_accum2(a,ch128_512_xor(ch128_512_load(p+1536),kt[12]),ch128_512_xor(ch128_512_load(p+1664),kt[13]),ch128_512_xor(ch128_512_load(p+1792),kt[14]),ch128_512_xor(ch128_512_load(p+1920),kt[15]),0);
 #if CHAINHASH128_BLOCK_BYTES == 512
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+2048),ch128_512_bc(k->ph+16)),ch128_512_xor(ch128_512_load(p+2176),ch128_512_bc(k->ph+17)),0);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+2304),ch128_512_bc(k->ph+18)),ch128_512_xor(ch128_512_load(p+2432),ch128_512_bc(k->ph+19)),0);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+2560),ch128_512_bc(k->ph+20)),ch128_512_xor(ch128_512_load(p+2688),ch128_512_bc(k->ph+21)),0);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+2816),ch128_512_bc(k->ph+22)),ch128_512_xor(ch128_512_load(p+2944),ch128_512_bc(k->ph+23)),0);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+3072),ch128_512_bc(k->ph+24)),ch128_512_xor(ch128_512_load(p+3200),ch128_512_bc(k->ph+25)),0);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+3328),ch128_512_bc(k->ph+26)),ch128_512_xor(ch128_512_load(p+3456),ch128_512_bc(k->ph+27)),0);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+3584),ch128_512_bc(k->ph+28)),ch128_512_xor(ch128_512_load(p+3712),ch128_512_bc(k->ph+29)),0);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+3840),ch128_512_bc(k->ph+30)),ch128_512_xor(ch128_512_load(p+3968),ch128_512_bc(k->ph+31)),0);
+        a=ch128_512_accum2(a,ch128_512_xor(ch128_512_load(p+2048),kt[16]),ch128_512_xor(ch128_512_load(p+2176),kt[17]),ch128_512_xor(ch128_512_load(p+2304),kt[18]),ch128_512_xor(ch128_512_load(p+2432),kt[19]),0);
+        a=ch128_512_accum2(a,ch128_512_xor(ch128_512_load(p+2560),kt[20]),ch128_512_xor(ch128_512_load(p+2688),kt[21]),ch128_512_xor(ch128_512_load(p+2816),kt[22]),ch128_512_xor(ch128_512_load(p+2944),kt[23]),0);
+        a=ch128_512_accum2(a,ch128_512_xor(ch128_512_load(p+3072),kt[24]),ch128_512_xor(ch128_512_load(p+3200),kt[25]),ch128_512_xor(ch128_512_load(p+3328),kt[26]),ch128_512_xor(ch128_512_load(p+3456),kt[27]),0);
+        a=ch128_512_accum2(a,ch128_512_xor(ch128_512_load(p+3584),kt[28]),ch128_512_xor(ch128_512_load(p+3712),kt[29]),ch128_512_xor(ch128_512_load(p+3840),kt[30]),ch128_512_xor(ch128_512_load(p+3968),kt[31]),0);
 #endif
-        a=ch128_512_accum(a,state.lo,y,0);a=ch128_512_accum(a,state.hi,h,0);state=ch128_512_pack(a,0); }
-      { ch128_512_acc a=ch128_512_azero();
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+64),ch128_512_bc(k->ph+0)),ch128_512_xor(ch128_512_load(p+192),ch128_512_bc(k->ph+1)),0);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+320),ch128_512_bc(k->ph+2)),ch128_512_xor(ch128_512_load(p+448),ch128_512_bc(k->ph+3)),0);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+576),ch128_512_bc(k->ph+4)),ch128_512_xor(ch128_512_load(p+704),ch128_512_bc(k->ph+5)),0);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+832),ch128_512_bc(k->ph+6)),ch128_512_xor(ch128_512_load(p+960),ch128_512_bc(k->ph+7)),0);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+1088),ch128_512_bc(k->ph+8)),ch128_512_xor(ch128_512_load(p+1216),ch128_512_bc(k->ph+9)),0);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+1344),ch128_512_bc(k->ph+10)),ch128_512_xor(ch128_512_load(p+1472),ch128_512_bc(k->ph+11)),0);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+1600),ch128_512_bc(k->ph+12)),ch128_512_xor(ch128_512_load(p+1728),ch128_512_bc(k->ph+13)),0);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+1856),ch128_512_bc(k->ph+14)),ch128_512_xor(ch128_512_load(p+1984),ch128_512_bc(k->ph+15)),0);
+        a=ch128_512_accum2(a,state.lo,y,state.hi,h,0);state=ch128_512_pack(a,0); }
+      { ch128_512_acc a=ch128_512_azero(); const __m512i *kt=kz; __asm__ volatile("" : "+r"(kt));
+        a=ch128_512_accum2(a,ch128_512_xor(ch128_512_load(p+64),kt[0]),ch128_512_xor(ch128_512_load(p+192),kt[1]),ch128_512_xor(ch128_512_load(p+320),kt[2]),ch128_512_xor(ch128_512_load(p+448),kt[3]),0);
+        a=ch128_512_accum2(a,ch128_512_xor(ch128_512_load(p+576),kt[4]),ch128_512_xor(ch128_512_load(p+704),kt[5]),ch128_512_xor(ch128_512_load(p+832),kt[6]),ch128_512_xor(ch128_512_load(p+960),kt[7]),0);
+        a=ch128_512_accum2(a,ch128_512_xor(ch128_512_load(p+1088),kt[8]),ch128_512_xor(ch128_512_load(p+1216),kt[9]),ch128_512_xor(ch128_512_load(p+1344),kt[10]),ch128_512_xor(ch128_512_load(p+1472),kt[11]),0);
+        a=ch128_512_accum2(a,ch128_512_xor(ch128_512_load(p+1600),kt[12]),ch128_512_xor(ch128_512_load(p+1728),kt[13]),ch128_512_xor(ch128_512_load(p+1856),kt[14]),ch128_512_xor(ch128_512_load(p+1984),kt[15]),0);
 #if CHAINHASH128_BLOCK_BYTES == 512
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+2112),ch128_512_bc(k->ph+16)),ch128_512_xor(ch128_512_load(p+2240),ch128_512_bc(k->ph+17)),0);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+2368),ch128_512_bc(k->ph+18)),ch128_512_xor(ch128_512_load(p+2496),ch128_512_bc(k->ph+19)),0);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+2624),ch128_512_bc(k->ph+20)),ch128_512_xor(ch128_512_load(p+2752),ch128_512_bc(k->ph+21)),0);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+2880),ch128_512_bc(k->ph+22)),ch128_512_xor(ch128_512_load(p+3008),ch128_512_bc(k->ph+23)),0);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+3136),ch128_512_bc(k->ph+24)),ch128_512_xor(ch128_512_load(p+3264),ch128_512_bc(k->ph+25)),0);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+3392),ch128_512_bc(k->ph+26)),ch128_512_xor(ch128_512_load(p+3520),ch128_512_bc(k->ph+27)),0);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+3648),ch128_512_bc(k->ph+28)),ch128_512_xor(ch128_512_load(p+3776),ch128_512_bc(k->ph+29)),0);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+3904),ch128_512_bc(k->ph+30)),ch128_512_xor(ch128_512_load(p+4032),ch128_512_bc(k->ph+31)),0);
+        a=ch128_512_accum2(a,ch128_512_xor(ch128_512_load(p+2112),kt[16]),ch128_512_xor(ch128_512_load(p+2240),kt[17]),ch128_512_xor(ch128_512_load(p+2368),kt[18]),ch128_512_xor(ch128_512_load(p+2496),kt[19]),0);
+        a=ch128_512_accum2(a,ch128_512_xor(ch128_512_load(p+2624),kt[20]),ch128_512_xor(ch128_512_load(p+2752),kt[21]),ch128_512_xor(ch128_512_load(p+2880),kt[22]),ch128_512_xor(ch128_512_load(p+3008),kt[23]),0);
+        a=ch128_512_accum2(a,ch128_512_xor(ch128_512_load(p+3136),kt[24]),ch128_512_xor(ch128_512_load(p+3264),kt[25]),ch128_512_xor(ch128_512_load(p+3392),kt[26]),ch128_512_xor(ch128_512_load(p+3520),kt[27]),0);
+        a=ch128_512_accum2(a,ch128_512_xor(ch128_512_load(p+3648),kt[28]),ch128_512_xor(ch128_512_load(p+3776),kt[29]),ch128_512_xor(ch128_512_load(p+3904),kt[30]),ch128_512_xor(ch128_512_load(p+4032),kt[31]),0);
 #endif
-        a=ch128_512_accum(a,state.lo,y,0);a=ch128_512_accum(a,state.hi,h,0);state=ch128_512_pack(a,0); }
+        a=ch128_512_accum2(a,state.lo,y,state.hi,h,0);state=ch128_512_pack(a,0); }
       p+=CH128_REGION;
     } while(--regions);
     { ch128_raw acc={{0,0},{0,0}}; ch128_word lo[4],hi[4]; unsigned j;
@@ -1153,48 +1155,39 @@ CH128_T512 CH128_INLINE ch128_word ch128_512_bulk1_run(const chainhash128_key *k
     const __m512i y=ch128_512_bc(k->yp+4),h=ch128_512_bc(k->yh+4);
     ch128_512_raw state; ch128_word init[4]={{0,0}}; init[3].lo=len; state.lo=ch128_512_load(init);state.hi=ch128_512_zero();
     if(st) state=ch128_512_in(st);
+    /* The 32 chunk keys, broadcast once per call and read back with plain loads (on Zen 4 a
+     * ZMM broadcast from memory also takes a shuffle slot). The clobber keeps the compiler
+     * from folding the table back into broadcasts; each pass launders the table pointer so
+     * the keys are not hoisted out of the loop and spilled a second time. */
+    __m512i kz[CH128_W]; unsigned c;
+    for(c=0;c<CH128_W;c++) kz[c]=ch128_512_bc(k->ph+c);
+    __asm__ volatile("" : : "r"(kz) : "memory");
     do {
         CH128_PREFETCH(p,regions,CH128_REGION,hint,step,dist);
-      { ch128_512_acc a=ch128_512_azero();
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+0),ch128_512_bc(k->ph+0)),ch128_512_xor(ch128_512_load(p+128),ch128_512_bc(k->ph+1)),1);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+256),ch128_512_bc(k->ph+2)),ch128_512_xor(ch128_512_load(p+384),ch128_512_bc(k->ph+3)),1);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+512),ch128_512_bc(k->ph+4)),ch128_512_xor(ch128_512_load(p+640),ch128_512_bc(k->ph+5)),1);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+768),ch128_512_bc(k->ph+6)),ch128_512_xor(ch128_512_load(p+896),ch128_512_bc(k->ph+7)),1);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+1024),ch128_512_bc(k->ph+8)),ch128_512_xor(ch128_512_load(p+1152),ch128_512_bc(k->ph+9)),1);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+1280),ch128_512_bc(k->ph+10)),ch128_512_xor(ch128_512_load(p+1408),ch128_512_bc(k->ph+11)),1);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+1536),ch128_512_bc(k->ph+12)),ch128_512_xor(ch128_512_load(p+1664),ch128_512_bc(k->ph+13)),1);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+1792),ch128_512_bc(k->ph+14)),ch128_512_xor(ch128_512_load(p+1920),ch128_512_bc(k->ph+15)),1);
+      { ch128_512_acc a=ch128_512_azero(); const __m512i *kt=kz; __asm__ volatile("" : "+r"(kt));
+        a=ch128_512_accum2(a,ch128_512_xor(ch128_512_load(p+0),kt[0]),ch128_512_xor(ch128_512_load(p+128),kt[1]),ch128_512_xor(ch128_512_load(p+256),kt[2]),ch128_512_xor(ch128_512_load(p+384),kt[3]),1);
+        a=ch128_512_accum2(a,ch128_512_xor(ch128_512_load(p+512),kt[4]),ch128_512_xor(ch128_512_load(p+640),kt[5]),ch128_512_xor(ch128_512_load(p+768),kt[6]),ch128_512_xor(ch128_512_load(p+896),kt[7]),1);
+        a=ch128_512_accum2(a,ch128_512_xor(ch128_512_load(p+1024),kt[8]),ch128_512_xor(ch128_512_load(p+1152),kt[9]),ch128_512_xor(ch128_512_load(p+1280),kt[10]),ch128_512_xor(ch128_512_load(p+1408),kt[11]),1);
+        a=ch128_512_accum2(a,ch128_512_xor(ch128_512_load(p+1536),kt[12]),ch128_512_xor(ch128_512_load(p+1664),kt[13]),ch128_512_xor(ch128_512_load(p+1792),kt[14]),ch128_512_xor(ch128_512_load(p+1920),kt[15]),1);
 #if CHAINHASH128_BLOCK_BYTES == 512
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+2048),ch128_512_bc(k->ph+16)),ch128_512_xor(ch128_512_load(p+2176),ch128_512_bc(k->ph+17)),1);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+2304),ch128_512_bc(k->ph+18)),ch128_512_xor(ch128_512_load(p+2432),ch128_512_bc(k->ph+19)),1);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+2560),ch128_512_bc(k->ph+20)),ch128_512_xor(ch128_512_load(p+2688),ch128_512_bc(k->ph+21)),1);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+2816),ch128_512_bc(k->ph+22)),ch128_512_xor(ch128_512_load(p+2944),ch128_512_bc(k->ph+23)),1);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+3072),ch128_512_bc(k->ph+24)),ch128_512_xor(ch128_512_load(p+3200),ch128_512_bc(k->ph+25)),1);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+3328),ch128_512_bc(k->ph+26)),ch128_512_xor(ch128_512_load(p+3456),ch128_512_bc(k->ph+27)),1);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+3584),ch128_512_bc(k->ph+28)),ch128_512_xor(ch128_512_load(p+3712),ch128_512_bc(k->ph+29)),1);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+3840),ch128_512_bc(k->ph+30)),ch128_512_xor(ch128_512_load(p+3968),ch128_512_bc(k->ph+31)),1);
+        a=ch128_512_accum2(a,ch128_512_xor(ch128_512_load(p+2048),kt[16]),ch128_512_xor(ch128_512_load(p+2176),kt[17]),ch128_512_xor(ch128_512_load(p+2304),kt[18]),ch128_512_xor(ch128_512_load(p+2432),kt[19]),1);
+        a=ch128_512_accum2(a,ch128_512_xor(ch128_512_load(p+2560),kt[20]),ch128_512_xor(ch128_512_load(p+2688),kt[21]),ch128_512_xor(ch128_512_load(p+2816),kt[22]),ch128_512_xor(ch128_512_load(p+2944),kt[23]),1);
+        a=ch128_512_accum2(a,ch128_512_xor(ch128_512_load(p+3072),kt[24]),ch128_512_xor(ch128_512_load(p+3200),kt[25]),ch128_512_xor(ch128_512_load(p+3328),kt[26]),ch128_512_xor(ch128_512_load(p+3456),kt[27]),1);
+        a=ch128_512_accum2(a,ch128_512_xor(ch128_512_load(p+3584),kt[28]),ch128_512_xor(ch128_512_load(p+3712),kt[29]),ch128_512_xor(ch128_512_load(p+3840),kt[30]),ch128_512_xor(ch128_512_load(p+3968),kt[31]),1);
 #endif
-        a=ch128_512_accum(a,state.lo,y,1);a=ch128_512_accum(a,state.hi,h,1);state=ch128_512_pack(a,1); }
-      { ch128_512_acc a=ch128_512_azero();
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+64),ch128_512_bc(k->ph+0)),ch128_512_xor(ch128_512_load(p+192),ch128_512_bc(k->ph+1)),1);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+320),ch128_512_bc(k->ph+2)),ch128_512_xor(ch128_512_load(p+448),ch128_512_bc(k->ph+3)),1);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+576),ch128_512_bc(k->ph+4)),ch128_512_xor(ch128_512_load(p+704),ch128_512_bc(k->ph+5)),1);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+832),ch128_512_bc(k->ph+6)),ch128_512_xor(ch128_512_load(p+960),ch128_512_bc(k->ph+7)),1);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+1088),ch128_512_bc(k->ph+8)),ch128_512_xor(ch128_512_load(p+1216),ch128_512_bc(k->ph+9)),1);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+1344),ch128_512_bc(k->ph+10)),ch128_512_xor(ch128_512_load(p+1472),ch128_512_bc(k->ph+11)),1);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+1600),ch128_512_bc(k->ph+12)),ch128_512_xor(ch128_512_load(p+1728),ch128_512_bc(k->ph+13)),1);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+1856),ch128_512_bc(k->ph+14)),ch128_512_xor(ch128_512_load(p+1984),ch128_512_bc(k->ph+15)),1);
+        a=ch128_512_accum2(a,state.lo,y,state.hi,h,1);state=ch128_512_pack(a,1); }
+      { ch128_512_acc a=ch128_512_azero(); const __m512i *kt=kz; __asm__ volatile("" : "+r"(kt));
+        a=ch128_512_accum2(a,ch128_512_xor(ch128_512_load(p+64),kt[0]),ch128_512_xor(ch128_512_load(p+192),kt[1]),ch128_512_xor(ch128_512_load(p+320),kt[2]),ch128_512_xor(ch128_512_load(p+448),kt[3]),1);
+        a=ch128_512_accum2(a,ch128_512_xor(ch128_512_load(p+576),kt[4]),ch128_512_xor(ch128_512_load(p+704),kt[5]),ch128_512_xor(ch128_512_load(p+832),kt[6]),ch128_512_xor(ch128_512_load(p+960),kt[7]),1);
+        a=ch128_512_accum2(a,ch128_512_xor(ch128_512_load(p+1088),kt[8]),ch128_512_xor(ch128_512_load(p+1216),kt[9]),ch128_512_xor(ch128_512_load(p+1344),kt[10]),ch128_512_xor(ch128_512_load(p+1472),kt[11]),1);
+        a=ch128_512_accum2(a,ch128_512_xor(ch128_512_load(p+1600),kt[12]),ch128_512_xor(ch128_512_load(p+1728),kt[13]),ch128_512_xor(ch128_512_load(p+1856),kt[14]),ch128_512_xor(ch128_512_load(p+1984),kt[15]),1);
 #if CHAINHASH128_BLOCK_BYTES == 512
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+2112),ch128_512_bc(k->ph+16)),ch128_512_xor(ch128_512_load(p+2240),ch128_512_bc(k->ph+17)),1);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+2368),ch128_512_bc(k->ph+18)),ch128_512_xor(ch128_512_load(p+2496),ch128_512_bc(k->ph+19)),1);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+2624),ch128_512_bc(k->ph+20)),ch128_512_xor(ch128_512_load(p+2752),ch128_512_bc(k->ph+21)),1);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+2880),ch128_512_bc(k->ph+22)),ch128_512_xor(ch128_512_load(p+3008),ch128_512_bc(k->ph+23)),1);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+3136),ch128_512_bc(k->ph+24)),ch128_512_xor(ch128_512_load(p+3264),ch128_512_bc(k->ph+25)),1);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+3392),ch128_512_bc(k->ph+26)),ch128_512_xor(ch128_512_load(p+3520),ch128_512_bc(k->ph+27)),1);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+3648),ch128_512_bc(k->ph+28)),ch128_512_xor(ch128_512_load(p+3776),ch128_512_bc(k->ph+29)),1);
-        a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+3904),ch128_512_bc(k->ph+30)),ch128_512_xor(ch128_512_load(p+4032),ch128_512_bc(k->ph+31)),1);
+        a=ch128_512_accum2(a,ch128_512_xor(ch128_512_load(p+2112),kt[16]),ch128_512_xor(ch128_512_load(p+2240),kt[17]),ch128_512_xor(ch128_512_load(p+2368),kt[18]),ch128_512_xor(ch128_512_load(p+2496),kt[19]),1);
+        a=ch128_512_accum2(a,ch128_512_xor(ch128_512_load(p+2624),kt[20]),ch128_512_xor(ch128_512_load(p+2752),kt[21]),ch128_512_xor(ch128_512_load(p+2880),kt[22]),ch128_512_xor(ch128_512_load(p+3008),kt[23]),1);
+        a=ch128_512_accum2(a,ch128_512_xor(ch128_512_load(p+3136),kt[24]),ch128_512_xor(ch128_512_load(p+3264),kt[25]),ch128_512_xor(ch128_512_load(p+3392),kt[26]),ch128_512_xor(ch128_512_load(p+3520),kt[27]),1);
+        a=ch128_512_accum2(a,ch128_512_xor(ch128_512_load(p+3648),kt[28]),ch128_512_xor(ch128_512_load(p+3776),kt[29]),ch128_512_xor(ch128_512_load(p+3904),kt[30]),ch128_512_xor(ch128_512_load(p+4032),kt[31]),1);
 #endif
-        a=ch128_512_accum(a,state.lo,y,1);a=ch128_512_accum(a,state.hi,h,1);state=ch128_512_pack(a,1); }
+        a=ch128_512_accum2(a,state.lo,y,state.hi,h,1);state=ch128_512_pack(a,1); }
       p+=CH128_REGION;
     } while(--regions);
     { ch128_raw acc={{0,0},{0,0}}; ch128_word lo[4],hi[4]; unsigned j;
