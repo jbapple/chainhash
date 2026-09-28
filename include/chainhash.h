@@ -46,9 +46,13 @@ static inline uint64_t ch_reduce(ch_raw a) {
     return a.lo^h^(h<<1)^(h<<3)^(h<<4)^q^(q<<1)^(q<<3)^(q<<4);
 }
 static inline uint64_t ch_mul(uint64_t a,uint64_t b) { return ch_reduce(ch_clmul(a,b)); }
+/* Key expansion multiplies with the dispatched hardware product (defined below; the
+ * same field product as ch_mul, which a portable build uses). */
+static inline int chainhash_backend(void);
+static inline uint64_t ch_fmul(uint64_t a,uint64_t b,int backend);
 static inline void ch_schedule(chainhash_key *k,uint64_t y) {
-    unsigned i; k->yp[0]=1; k->yh[0]=27;
-    for(i=1;i<=8;i++) { k->yp[i]=ch_mul(k->yp[i-1],y); k->yh[i]=ch_mul(27,k->yp[i]); }
+    unsigned i; int b=chainhash_backend(); k->yp[0]=1; k->yh[0]=27;
+    for(i=1;i<=8;i++) { k->yp[i]=ch_fmul(k->yp[i-1],y,b); k->yh[i]=ch_fmul(27,k->yp[i],b); }
 }
 static inline chainhash_key chainhash_key_from_words(const uint64_t w[39]) {
     chainhash_key k; unsigned c;
@@ -56,8 +60,8 @@ static inline chainhash_key chainhash_key_from_words(const uint64_t w[39]) {
     ch_schedule(&k,w[32]); for(c=0;c<5;c++) k.c[c]=w[33+c]; k.tau=w[38]; return k;
 }
 static inline chainhash_key chainhash_key_from_bytes(const uint8_t b[64]) {
-    uint64_t w[39],s=ch_word(b,64,0),v=s; unsigned i;
-    for(i=0;i<32;i++) { w[i]=v; v=ch_mul(v,s); }
+    uint64_t w[39],s=ch_word(b,64,0),v=s; unsigned i; int hw=chainhash_backend();
+    for(i=0;i<32;i++) { w[i]=v; v=ch_fmul(v,s,hw); }
     for(i=0;i<7;i++) w[32+i]=ch_word(b,64,8*(i+1));
     return chainhash_key_from_words(w);
 }

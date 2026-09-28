@@ -386,15 +386,15 @@ static inline ch128_word ch128_pow(ch128_word a,uint64_t n,int b) {
     ch128_word r=ch128_make(1,0); while(n) { if(n&1) r=ch128_mul(r,a,b); n>>=1; if(n) a=ch128_mul(a,a,b); } return r;
 }
 static inline chainhash128_key chainhash128_key_from_words(const ch128_word *w) {
-    chainhash128_key k; unsigned i; memcpy(k.ph,w,sizeof(k.ph));
+    chainhash128_key k; unsigned i; int b=chainhash128_backend(); memcpy(k.ph,w,sizeof(k.ph));
     k.yp[0]=ch128_make(1,0); k.yh[0]=ch128_make(0x87,0);
-    for(i=1;i<=8;i++) { k.yp[i]=ch128_mul_ref(k.yp[i-1],w[CH128_W]); k.yh[i]=ch128_mul_ref(k.yp[i],k.yh[0]); }
+    for(i=1;i<=8;i++) { k.yp[i]=ch128_mul(k.yp[i-1],w[CH128_W],b); k.yh[i]=ch128_mul(k.yp[i],k.yh[0],b); }
     for(i=0;i<5;i++) k.c[i]=w[CH128_W+1+i];
     k.tau=w[CH128_W+6]; return k;
 }
 static inline chainhash128_key chainhash128_key_from_bytes(const uint8_t p[128]) {
-    ch128_word w[CH128_W+7],s=ch128_load(p),v=s; unsigned i;
-    for(i=0;i<CH128_W;i++) { w[i]=v; v=ch128_mul_ref(v,s); }
+    ch128_word w[CH128_W+7],s=ch128_load(p),v=s; unsigned i; int b=chainhash128_backend();
+    for(i=0;i<CH128_W;i++) { w[i]=v; v=ch128_mul(v,s,b); }
     for(i=0;i<7;i++) w[CH128_W+i]=ch128_load(p+16*(i+1));
     return chainhash128_key_from_words(w);
 }
