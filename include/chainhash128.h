@@ -420,6 +420,16 @@ static inline ch128_word ch128_n_finish(const chainhash128_key *k,uint64x2_t vv)
     r=ch128_n_xor(ch128_n_mul(ch128_n_xor(x,ch128_n_load(k->c+2)),ch128_n_xor(r,ch128_n_load(k->c+3))),ch128_n_load(k->c+4));
     ch128_n_store(&v,r);return v;
 }
+/* The 16-byte word at q+o with the bytes at or past q+rem zeroed, read in place
+ * (the partial word as the 16 bytes ending at q+rem, shifted down by TBL); the
+ * caller guarantees q+rem-16 is readable. No buffer, so no store-forwarding stall. */
+static inline uint64x2_t ch128_n_word(const uint8_t *q,size_t o,size_t rem) {
+    static const uint8_t idx[32]={0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,
+        0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80};
+    if(o+16<=rem) return ch128_n_load(q+o);
+    if(o>=rem) return ch128_n_zero();
+    return vreinterpretq_u64_u8(vqtbl1q_u8(vreinterpretq_u8_u64(ch128_n_load(q+rem-16)),vld1q_u8(idx+16-(rem-o))));
+}
 /* For n<=128 every comb partner is absent. Factor its common key kb:
  * V = n*y^p + kb * Horner_y(w0+ka,...,w_(p-1)+ka). */
 static inline ch128_word ch128_n_short(const chainhash128_key *k,const uint8_t *p,size_t n) {
@@ -428,10 +438,11 @@ static inline ch128_word ch128_n_short(const chainhash128_key *k,const uint8_t *
      * vector built in a register. Same V as the stride-4 chains (evaluation independence). */
     unsigned count=n?(unsigned)((n+15)/16):0,j; uint64x2_t state=ch128_n_zero();
     if(count) {
-        uint8_t buf[128]; uint64x2_t ka=ch128_n_load(k->ph),yp,lv,l,m,H; ch128_n_acc a=ch128_n_azero(); ch128_n_raw r;
-        memset(buf,0,sizeof buf); memcpy(buf,p,n);
-        for(j=0;j+1<count;j++) a=ch128_n_accum(a,ch128_n_xor(vld1q_u64((const uint64_t *)(buf+16*j)),ka),ch128_n_load(k->yp+count-1-j),1);
-        r=ch128_n_pack(a,1); r.lo=ch128_n_xor(r.lo,ch128_n_xor(vld1q_u64((const uint64_t *)(buf+16*(count-1))),ka)); H=ch128_n_reduce(r);
+        uint64x2_t ka=ch128_n_load(k->ph),yp,lv,l,m,H,last; ch128_n_acc a=ch128_n_azero(); ch128_n_raw r;
+        for(j=0;j+1<count;j++) a=ch128_n_accum(a,ch128_n_xor(ch128_n_load(p+16*j),ka),ch128_n_load(k->yp+count-1-j),1);
+        if(n>=16) last=ch128_n_word(p,16*(size_t)(count-1),n);
+        else { uint8_t b16[16]={0}; memcpy(b16,p,n); last=vld1q_u64((const uint64_t *)b16); }
+        r=ch128_n_pack(a,1); r.lo=ch128_n_xor(r.lo,ch128_n_xor(last,ka)); H=ch128_n_reduce(r);
         a=ch128_n_accum(ch128_n_azero(),H,ch128_n_load(k->ph+1),0);
         yp=ch128_n_load(k->yp+count);lv=vdupq_n_u64((uint64_t)n);   /* {n,n}: pmull2 supplies yp.hi*n for the Karatsuba middle term */
         l=ch128_n_ll(yp,lv);m=ch128_n_hh(yp,lv);
@@ -1838,50 +1849,71 @@ static inline ch128_word chainhash128_portable(const chainhash128_key *k,const v
 }
 #ifdef CH128_X86
 /* One tail kernel for all x86 widths. Pad only the last chunk and key only
- * present pairs. Fold raw lanes with y^e and X^128*y^e, then reduce once. */
-#define CH128_XTAIL(P,T,N) \
+ * present pairs. Fold raw lanes with y^e and X^128*y^e, then reduce once.
+ * Words are read in place: whole vectors straight from the input, the last
+ * partial word as the 16 bytes ending at p+n shifted down (tails follow at least
+ * 128 input bytes), and the reversed y powers are formed in registers, so no
+ * vector load reads back narrower stores (store-forwarding stalls). */
+CH128_T128 static inline __m128i ch128_128_word(const uint8_t *q,size_t o,size_t rem) {
+    static const uint8_t idx[32]={0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,
+        0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80};
+    if(o+16<=rem) return ch128_128_load(q+o);
+    if(o>=rem) return ch128_128_zero();
+    return _mm_shuffle_epi8(ch128_128_load(q+rem-16),ch128_128_load(idx+16-(rem-o)));
+}
+CH128_T128 static inline __m128i ch128_128_mk(__m128i a,__m128i b,__m128i c,__m128i d) { (void)b; (void)c; (void)d; return a; }
+CH128_T256 static inline __m256i ch128_256_mk(__m128i a,__m128i b,__m128i c,__m128i d) { (void)c; (void)d; return _mm256_inserti128_si256(_mm256_castsi128_si256(a),b,1); }
+CH128_T512 static inline __m512i ch128_512_mk(__m128i a,__m128i b,__m128i c,__m128i d) {
+    return _mm512_inserti32x4(_mm512_inserti32x4(_mm512_inserti32x4(_mm512_castsi128_si512(a),b,1),c,2),d,3);
+}
+#define CH128_XTAIL(P,T,N,V) \
+/* Words j..j+N-1 of the half at off of the last chunk, keyed; a pair whose first \
+ * word is absent is zero. */ \
+T static inline V P##_tw(const uint8_t *q,unsigned j,size_t rem,const ch128_word *key,size_t off) { \
+    __m128i w[4],kk=ch128_128_load(key); unsigned t; \
+    if(off+16*(j+N)<=rem) return P##_xor(P##_load(q+off+16*j),P##_bc(key)); \
+    for(t=0;t<4;t++) w[t]=t<N && 16*(j+t)<rem ? ch128_128_xor(ch128_128_word(q,off+16*(j+t),rem),kk) : ch128_128_zero(); \
+    return P##_mk(w[0],w[1],w[2],w[3]); \
+} \
+T static inline V P##_yw(const ch128_word *y,unsigned count,unsigned j) { \
+    __m128i w[4]; unsigned t; \
+    for(t=0;t<4;t++) w[t]=t<N && j+t<count ? ch128_128_load(y+count-1-j-t) : ch128_128_zero(); \
+    return P##_mk(w[0],w[1],w[2],w[3]); \
+} \
 T static inline ch128_word P##_tail(const chainhash128_key *k,const uint8_t *p,size_t n,ch128_word v,int school) { \
-    ch128_word tail[16]={{0,0}},yp[8]={{0,0}},yh[8]={{0,0}},lo[N],hi[N]; \
+    ch128_word lo[N],hi[N]; \
     size_t chunks=n/256,rem=n%256; unsigned j,c,count=ch128_lanes(n); \
-    P##_acc sum=P##_azero(); P##_raw r; \
-    ch128_128_raw total=ch128_128_prod(ch128_128_load(&v),ch128_128_load(k->yp+count),0); \
-    if(rem) { \
-        memcpy(tail,p+256*chunks,rem); \
-        for(j=0;j<8 && 16*j<rem;j++) { \
-            tail[j]=ch128_xor(tail[j],k->ph[2*chunks]); \
-            tail[j+8]=ch128_xor(tail[j+8],k->ph[2*chunks+1]); \
-        } \
-    } \
-    for(j=0;j<count;j++) { yp[j]=k->yp[count-1-j]; yh[j]=k->yh[count-1-j]; } \
+    const uint8_t *q=p+256*chunks; P##_acc sum=P##_azero(); P##_raw r; \
+    ch128_128_raw total=ch128_128_prod(_mm_set_epi64x((long long)v.hi,(long long)v.lo),ch128_128_load(k->yp+count),0); \
     for(j=0;j<8;j+=N) { \
         P##_acc a=P##_azero(); \
         for(c=0;c<chunks;c++) \
             a=P##_accum(a,P##_xor(P##_load(p+256*c+16*j),P##_bc(k->ph+2*c)), \
                            P##_xor(P##_load(p+256*c+16*j+128),P##_bc(k->ph+2*c+1)),school); \
-        if(rem) a=P##_accum(a,P##_load(tail+j),P##_load(tail+j+8),school); \
+        if(16*j<rem) a=P##_accum(a,P##_tw(q,j,rem,k->ph+2*chunks,0),P##_tw(q,j,rem,k->ph+2*chunks+1,128),school); \
         r=P##_pack(a,school); \
-        sum=P##_accum(sum,r.lo,P##_load(yp+j),0); \
-        sum=P##_accum(sum,r.hi,P##_load(yh+j),0); \
+        sum=P##_accum(sum,r.lo,P##_yw(k->yp,count,j),0); \
+        sum=P##_accum(sum,r.hi,P##_yw(k->yh,count,j),0); \
     } \
     r=P##_pack(sum,0); P##_store(lo,r.lo); P##_store(hi,r.hi); \
     for(j=0;j<N;j++) { total.lo=ch128_128_xor(total.lo,ch128_128_load(lo+j)); total.hi=ch128_128_xor(total.hi,ch128_128_load(hi+j)); } \
     ch128_128_store(&v,ch128_128_reduce(total)); return v; \
 }
-CH128_XTAIL(ch128_128,CH128_T128,1)
-CH128_XTAIL(ch128_256,CH128_T256,2)
-CH128_XTAIL(ch128_512,CH128_T512,4)
+CH128_XTAIL(ch128_128,CH128_T128,1,__m128i)
+CH128_XTAIL(ch128_256,CH128_T256,2,__m256i)
+CH128_XTAIL(ch128_512,CH128_T512,4,__m512i)
 #undef CH128_XTAIL
 #endif
 #ifdef CH128_ARM
 CH128_NBEGIN
 /* Evaluate a partial comb region in vector registers. Only the final 256-byte
- * chunk needs padding; skip absent first words so no key-only pairs are added.
+ * chunk needs padding (words read in place by ch128_n_word; tails follow at least
+ * 128 input bytes); skip absent first words so no key-only pairs are added.
  * The cached powers combine the independent lanes without a serial Horner chain. */
 static inline ch128_word ch128_n_tail(const chainhash128_key *k,const uint8_t *p,size_t n,ch128_word v,int school) {
-    uint8_t tail[256]={0}; size_t chunks=n/256,rem=n%256; unsigned j,c,count=ch128_lanes(n);
-    ch128_n_acc sum=ch128_n_accum(ch128_n_azero(),ch128_n_load(&v),ch128_n_load(k->yp+count),0);
+    size_t chunks=n/256,rem=n%256; unsigned j,c,count=ch128_lanes(n); const uint8_t *q=p+256*chunks;
+    ch128_n_acc sum=ch128_n_accum(ch128_n_azero(),vcombine_u64(vcreate_u64(v.lo),vcreate_u64(v.hi)),ch128_n_load(k->yp+count),0);
     ch128_n_raw last;
-    if(rem) memcpy(tail,p+256*chunks,rem);
     last.lo=last.hi=ch128_n_zero();
     for(j=0;j<count;j++) {
         ch128_n_acc a=ch128_n_azero(); ch128_n_raw r;
@@ -1889,8 +1921,8 @@ static inline ch128_word ch128_n_tail(const chainhash128_key *k,const uint8_t *p
             a=ch128_n_accum(a,ch128_n_xor(ch128_n_load(p+256*c+16*j),ch128_n_load(k->ph+2*c)),
                               ch128_n_xor(ch128_n_load(p+256*c+16*j+128),ch128_n_load(k->ph+2*c+1)),school);
         if(16*j<rem)
-            a=ch128_n_accum(a,ch128_n_xor(ch128_n_load(tail+16*j),ch128_n_load(k->ph+2*chunks)),
-                              ch128_n_xor(ch128_n_load(tail+16*j+128),ch128_n_load(k->ph+2*chunks+1)),school);
+            a=ch128_n_accum(a,ch128_n_xor(ch128_n_word(q,16*j,rem),ch128_n_load(k->ph+2*chunks)),
+                              ch128_n_xor(ch128_n_word(q,16*j+128,rem),ch128_n_load(k->ph+2*chunks+1)),school);
         r=ch128_n_pack(a,school);
         if(j+1<count) sum=ch128_n_accum(sum,ch128_n_reduce(r),ch128_n_load(k->yp+count-1-j),0);
         else last=r;
