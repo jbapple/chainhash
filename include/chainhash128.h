@@ -1244,10 +1244,9 @@ static void ch128_n_region(const chainhash128_key *k,const uint8_t *p,ch128_raw 
       "eor v8.16b,v8.16b,v30.16b\n\t" \
       "pmull2 v30.1q,v20.2d,v24.2d\n\t" \
       "eor v9.16b,v9.16b,v30.16b\n\t" \
-      "ext v30.16b,v20.16b,v20.16b,#8\n\t" \
       "ext v31.16b,v24.16b,v24.16b,#8\n\t" \
-      "pmull v30.1q,v30.1d,v24.1d\n\t" \
-      "pmull v31.1q,v20.1d,v31.1d\n\t" \
+      "pmull v30.1q,v20.1d,v31.1d\n\t" \
+      "pmull2 v31.1q,v20.2d,v31.2d\n\t" \
       CH128_NX3(10,10,30,31) \
       "eor v21.16b,v21.16b,v28.16b\n\t" \
       "eor v25.16b,v25.16b,v29.16b\n\t" \
@@ -1255,10 +1254,9 @@ static void ch128_n_region(const chainhash128_key *k,const uint8_t *p,ch128_raw 
       "eor v11.16b,v11.16b,v30.16b\n\t" \
       "pmull2 v30.1q,v21.2d,v25.2d\n\t" \
       "eor v12.16b,v12.16b,v30.16b\n\t" \
-      "ext v30.16b,v21.16b,v21.16b,#8\n\t" \
       "ext v31.16b,v25.16b,v25.16b,#8\n\t" \
-      "pmull v30.1q,v30.1d,v25.1d\n\t" \
-      "pmull v31.1q,v21.1d,v31.1d\n\t" \
+      "pmull v30.1q,v21.1d,v31.1d\n\t" \
+      "pmull2 v31.1q,v21.2d,v31.2d\n\t" \
       CH128_NX3(13,13,30,31) \
       "eor v22.16b,v22.16b,v28.16b\n\t" \
       "eor v26.16b,v26.16b,v29.16b\n\t" \
@@ -1266,10 +1264,9 @@ static void ch128_n_region(const chainhash128_key *k,const uint8_t *p,ch128_raw 
       "eor v14.16b,v14.16b,v30.16b\n\t" \
       "pmull2 v30.1q,v22.2d,v26.2d\n\t" \
       "eor v15.16b,v15.16b,v30.16b\n\t" \
-      "ext v30.16b,v22.16b,v22.16b,#8\n\t" \
       "ext v31.16b,v26.16b,v26.16b,#8\n\t" \
-      "pmull v30.1q,v30.1d,v26.1d\n\t" \
-      "pmull v31.1q,v22.1d,v31.1d\n\t" \
+      "pmull v30.1q,v22.1d,v31.1d\n\t" \
+      "pmull2 v31.1q,v22.2d,v31.2d\n\t" \
       CH128_NX3(16,16,30,31) \
       "eor v23.16b,v23.16b,v28.16b\n\t" \
       "eor v27.16b,v27.16b,v29.16b\n\t" \
@@ -1277,10 +1274,9 @@ static void ch128_n_region(const chainhash128_key *k,const uint8_t *p,ch128_raw 
       "eor v17.16b,v17.16b,v30.16b\n\t" \
       "pmull2 v30.1q,v23.2d,v27.2d\n\t" \
       "eor v18.16b,v18.16b,v30.16b\n\t" \
-      "ext v30.16b,v23.16b,v23.16b,#8\n\t" \
       "ext v31.16b,v27.16b,v27.16b,#8\n\t" \
-      "pmull v30.1q,v30.1d,v27.1d\n\t" \
-      "pmull v31.1q,v23.1d,v31.1d\n\t" \
+      "pmull v30.1q,v23.1d,v31.1d\n\t" \
+      "pmull2 v31.1q,v23.2d,v31.2d\n\t" \
       CH128_NX3(19,19,30,31)
 #define CH128_NSTEP1 \
       CH128_NPH1 \
@@ -1293,19 +1289,17 @@ static void ch128_n_region(const chainhash128_key *k,const uint8_t *p,ch128_raw 
       "eor v8.16b,v8.16b,v30.16b\n\t" \
       "pmull2 v30.1q,v0.2d,v28.2d\n\t" \
       "eor v9.16b,v9.16b,v30.16b\n\t" \
-      "ext v30.16b,v0.16b,v0.16b,#8\n\t" \
       "ext v31.16b,v28.16b,v28.16b,#8\n\t" \
-      "pmull v30.1q,v30.1d,v28.1d\n\t" \
-      "pmull v31.1q,v0.1d,v31.1d\n\t" \
+      "pmull v30.1q,v0.1d,v31.1d\n\t" \
+      "pmull2 v31.1q,v0.2d,v31.2d\n\t" \
       CH128_NX3(10,10,30,31) \
       "pmull v30.1q,v1.1d,v29.1d\n\t" \
       "eor v8.16b,v8.16b,v30.16b\n\t" \
       "pmull2 v30.1q,v1.2d,v29.2d\n\t" \
       "eor v9.16b,v9.16b,v30.16b\n\t" \
-      "ext v30.16b,v1.16b,v1.16b,#8\n\t" \
       "ext v31.16b,v29.16b,v29.16b,#8\n\t" \
-      "pmull v30.1q,v30.1d,v29.1d\n\t" \
-      "pmull v31.1q,v1.1d,v31.1d\n\t" \
+      "pmull v30.1q,v1.1d,v31.1d\n\t" \
+      "pmull2 v31.1q,v1.2d,v31.2d\n\t" \
       CH128_NX3(10,10,30,31) \
       "movi v31.2d,#0\n\t" \
       "ext v30.16b,v31.16b,v10.16b,#8\n\t" \
@@ -1316,19 +1310,17 @@ static void ch128_n_region(const chainhash128_key *k,const uint8_t *p,ch128_raw 
       "eor v11.16b,v11.16b,v30.16b\n\t" \
       "pmull2 v30.1q,v2.2d,v28.2d\n\t" \
       "eor v12.16b,v12.16b,v30.16b\n\t" \
-      "ext v30.16b,v2.16b,v2.16b,#8\n\t" \
       "ext v31.16b,v28.16b,v28.16b,#8\n\t" \
-      "pmull v30.1q,v30.1d,v28.1d\n\t" \
-      "pmull v31.1q,v2.1d,v31.1d\n\t" \
+      "pmull v30.1q,v2.1d,v31.1d\n\t" \
+      "pmull2 v31.1q,v2.2d,v31.2d\n\t" \
       CH128_NX3(13,13,30,31) \
       "pmull v30.1q,v3.1d,v29.1d\n\t" \
       "eor v11.16b,v11.16b,v30.16b\n\t" \
       "pmull2 v30.1q,v3.2d,v29.2d\n\t" \
       "eor v12.16b,v12.16b,v30.16b\n\t" \
-      "ext v30.16b,v3.16b,v3.16b,#8\n\t" \
       "ext v31.16b,v29.16b,v29.16b,#8\n\t" \
-      "pmull v30.1q,v30.1d,v29.1d\n\t" \
-      "pmull v31.1q,v3.1d,v31.1d\n\t" \
+      "pmull v30.1q,v3.1d,v31.1d\n\t" \
+      "pmull2 v31.1q,v3.2d,v31.2d\n\t" \
       CH128_NX3(13,13,30,31) \
       "movi v31.2d,#0\n\t" \
       "ext v30.16b,v31.16b,v13.16b,#8\n\t" \
@@ -1339,19 +1331,17 @@ static void ch128_n_region(const chainhash128_key *k,const uint8_t *p,ch128_raw 
       "eor v14.16b,v14.16b,v30.16b\n\t" \
       "pmull2 v30.1q,v4.2d,v28.2d\n\t" \
       "eor v15.16b,v15.16b,v30.16b\n\t" \
-      "ext v30.16b,v4.16b,v4.16b,#8\n\t" \
       "ext v31.16b,v28.16b,v28.16b,#8\n\t" \
-      "pmull v30.1q,v30.1d,v28.1d\n\t" \
-      "pmull v31.1q,v4.1d,v31.1d\n\t" \
+      "pmull v30.1q,v4.1d,v31.1d\n\t" \
+      "pmull2 v31.1q,v4.2d,v31.2d\n\t" \
       CH128_NX3(16,16,30,31) \
       "pmull v30.1q,v5.1d,v29.1d\n\t" \
       "eor v14.16b,v14.16b,v30.16b\n\t" \
       "pmull2 v30.1q,v5.2d,v29.2d\n\t" \
       "eor v15.16b,v15.16b,v30.16b\n\t" \
-      "ext v30.16b,v5.16b,v5.16b,#8\n\t" \
       "ext v31.16b,v29.16b,v29.16b,#8\n\t" \
-      "pmull v30.1q,v30.1d,v29.1d\n\t" \
-      "pmull v31.1q,v5.1d,v31.1d\n\t" \
+      "pmull v30.1q,v5.1d,v31.1d\n\t" \
+      "pmull2 v31.1q,v5.2d,v31.2d\n\t" \
       CH128_NX3(16,16,30,31) \
       "movi v31.2d,#0\n\t" \
       "ext v30.16b,v31.16b,v16.16b,#8\n\t" \
@@ -1362,19 +1352,17 @@ static void ch128_n_region(const chainhash128_key *k,const uint8_t *p,ch128_raw 
       "eor v17.16b,v17.16b,v30.16b\n\t" \
       "pmull2 v30.1q,v6.2d,v28.2d\n\t" \
       "eor v18.16b,v18.16b,v30.16b\n\t" \
-      "ext v30.16b,v6.16b,v6.16b,#8\n\t" \
       "ext v31.16b,v28.16b,v28.16b,#8\n\t" \
-      "pmull v30.1q,v30.1d,v28.1d\n\t" \
-      "pmull v31.1q,v6.1d,v31.1d\n\t" \
+      "pmull v30.1q,v6.1d,v31.1d\n\t" \
+      "pmull2 v31.1q,v6.2d,v31.2d\n\t" \
       CH128_NX3(19,19,30,31) \
       "pmull v30.1q,v7.1d,v29.1d\n\t" \
       "eor v17.16b,v17.16b,v30.16b\n\t" \
       "pmull2 v30.1q,v7.2d,v29.2d\n\t" \
       "eor v18.16b,v18.16b,v30.16b\n\t" \
-      "ext v30.16b,v7.16b,v7.16b,#8\n\t" \
       "ext v31.16b,v29.16b,v29.16b,#8\n\t" \
-      "pmull v30.1q,v30.1d,v29.1d\n\t" \
-      "pmull v31.1q,v7.1d,v31.1d\n\t" \
+      "pmull v30.1q,v7.1d,v31.1d\n\t" \
+      "pmull2 v31.1q,v7.2d,v31.2d\n\t" \
       CH128_NX3(19,19,30,31) \
       "movi v31.2d,#0\n\t" \
       "ext v30.16b,v31.16b,v19.16b,#8\n\t" \
@@ -1480,6 +1468,52 @@ static __attribute__((noinline)) ch128_word ch128_n_bulk0(const chainhash128_key
  * v0..v7: raw states; v8..v19: three-component block accumulators;
  * v20..v27: four word pairs; v28/v29: keys; v30/v31: scratch.
  * No hot-loop stack spills or vector-to-integer transfers are possible. */
+/* Round-2: two-step batched schoolbook comb (NEW, M2 SHA3).
+ * Processes two adjacent 256-byte chunks per invocation and folds each
+ * pair's two low/high partial products into the lane accumulator with a
+ * single eor3 instead of two eor, cutting the accumulate-XOR op count in
+ * half. XOR is associative/commutative so the accumulated value, the
+ * reduction and the digest are bit-identical to CH128_NSTEP1. Uses only
+ * x9 (data) + x11 (key) with ldr-immediate offsets; keys are per-chunk and
+ * shared across the four lanes. Registers: v0-v7 states, v8-v19 lane
+ * accumulators, v20-v23 words, v24/v25 chunk-A ll/hh, v26-v29 the two key
+ * pairs, v30/v31 scratch. */
+#define CH128_NKEYS2 \
+      "ldr q28,[x11,#0]\n\t" \
+      "ldr q29,[x11,#16]\n\t" \
+      "ldr q26,[x11,#32]\n\t" \
+      "ldr q27,[x11,#48]\n\t"
+#define CH128_NPAIR2(OaA,ObA,OaB,ObB,LL,HH,MID) \
+      "ldr q20,[x9,#" #OaA "]\n\t" \
+      "ldr q21,[x9,#" #ObA "]\n\t" \
+      "ldr q22,[x9,#" #OaB "]\n\t" \
+      "ldr q23,[x9,#" #ObB "]\n\t" \
+      "eor v20.16b,v20.16b,v28.16b\n\t" \
+      "eor v21.16b,v21.16b,v29.16b\n\t" \
+      "eor v22.16b,v22.16b,v26.16b\n\t" \
+      "eor v23.16b,v23.16b,v27.16b\n\t" \
+      "pmull v24.1q,v20.1d,v21.1d\n\t" \
+      "pmull2 v25.1q,v20.2d,v21.2d\n\t" \
+      "ext v30.16b,v21.16b,v21.16b,#8\n\t" \
+      "pmull v31.1q,v20.1d,v30.1d\n\t" \
+      "pmull2 v30.1q,v20.2d,v30.2d\n\t" \
+      "eor3 v" #MID ".16b,v" #MID ".16b,v31.16b,v30.16b\n\t" \
+      "pmull v31.1q,v22.1d,v23.1d\n\t" \
+      "eor3 v" #LL ".16b,v" #LL ".16b,v24.16b,v31.16b\n\t" \
+      "pmull2 v31.1q,v22.2d,v23.2d\n\t" \
+      "eor3 v" #HH ".16b,v" #HH ".16b,v25.16b,v31.16b\n\t" \
+      "ext v30.16b,v23.16b,v23.16b,#8\n\t" \
+      "pmull v31.1q,v22.1d,v30.1d\n\t" \
+      "pmull2 v30.1q,v22.2d,v30.2d\n\t" \
+      "eor3 v" #MID ".16b,v" #MID ".16b,v31.16b,v30.16b\n\t"
+#define CH128_NPH1X2 \
+      CH128_NKEYS2 \
+      CH128_NPAIR2(0,128,256,384,8,9,10) \
+      CH128_NPAIR2(16,144,272,400,11,12,13) \
+      CH128_NPAIR2(32,160,288,416,14,15,16) \
+      CH128_NPAIR2(48,176,304,432,17,18,19) \
+      "add x9,x9,#512\n\t" \
+      "add x11,x11,#64\n\t"
 static __attribute__((noinline)) ch128_word ch128_n_bulk1(const chainhash128_key *k,const uint8_t *p,size_t regions,size_t len) {
     ch128_raw state[4],acc={{0,0},{0,0}};uint8_t *out=(uint8_t *)state;unsigned j;
     __asm__ volatile(
@@ -1506,25 +1540,16 @@ static __attribute__((noinline)) ch128_word ch128_n_bulk1(const chainhash128_key
       "movi v18.2d,#0\n\t"
       "movi v19.2d,#0\n\t"
       "add x9,%[p],#0\n\t"
-      "add x10,x9,#128\n\t"
       "mov x11,%[key]\n\t"
-      CH128_NSTEP1
-      CH128_NSTEP1
-      CH128_NSTEP1
-      CH128_NSTEP1
-      CH128_NSTEP1
-      CH128_NSTEP1
-      CH128_NSTEP1
-      CH128_NSTEP1
+      CH128_NPH1X2
+      CH128_NPH1X2
+      CH128_NPH1X2
+      CH128_NPH1X2
 #if CHAINHASH128_BLOCK_BYTES == 512
-      CH128_NSTEP1
-      CH128_NSTEP1
-      CH128_NSTEP1
-      CH128_NSTEP1
-      CH128_NSTEP1
-      CH128_NSTEP1
-      CH128_NSTEP1
-      CH128_NPH1
+      CH128_NPH1X2
+      CH128_NPH1X2
+      CH128_NPH1X2
+      CH128_NPH1X2
 #endif
       CH128_NFOLD1
       "movi v8.2d,#0\n\t"
@@ -1540,25 +1565,16 @@ static __attribute__((noinline)) ch128_word ch128_n_bulk1(const chainhash128_key
       "movi v18.2d,#0\n\t"
       "movi v19.2d,#0\n\t"
       "add x9,%[p],#64\n\t"
-      "add x10,x9,#128\n\t"
       "mov x11,%[key]\n\t"
-      CH128_NSTEP1
-      CH128_NSTEP1
-      CH128_NSTEP1
-      CH128_NSTEP1
-      CH128_NSTEP1
-      CH128_NSTEP1
-      CH128_NSTEP1
-      CH128_NSTEP1
+      CH128_NPH1X2
+      CH128_NPH1X2
+      CH128_NPH1X2
+      CH128_NPH1X2
 #if CHAINHASH128_BLOCK_BYTES == 512
-      CH128_NSTEP1
-      CH128_NSTEP1
-      CH128_NSTEP1
-      CH128_NSTEP1
-      CH128_NSTEP1
-      CH128_NSTEP1
-      CH128_NSTEP1
-      CH128_NPH1
+      CH128_NPH1X2
+      CH128_NPH1X2
+      CH128_NPH1X2
+      CH128_NPH1X2
 #endif
       CH128_NFOLD1
       "add %[p],%[p],%[rb]\n\t"
@@ -1578,6 +1594,9 @@ static __attribute__((noinline)) ch128_word ch128_n_bulk1(const chainhash128_key
 #undef CH128_NPH1
 #undef CH128_NSTEP1
 #undef CH128_NFOLD1
+#undef CH128_NKEYS2
+#undef CH128_NPAIR2
+#undef CH128_NPH1X2
 
 #endif
 
