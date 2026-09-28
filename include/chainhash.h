@@ -177,6 +177,19 @@ static inline int chainhash_backend(void) {
 #endif
 }
 static inline int chainhash_has_backend(int b) { int h=chainhash_backend(); return b==0 || (h==4 ? b==4 : b>0 && b<=h); }
+#ifdef CH_X86
+/* Whether PCLMULQDQ on XMM issues every cycle: Intel cores with ADX (Broadwell and
+ * later). AMD issues it once per two cycles at every width, Intel Sandy Bridge to
+ * Haswell once per two to eight (uops.info). */
+static inline int ch_pclmul_fast(void) {
+    static int cache=-1; int v=__atomic_load_n(&cache,__ATOMIC_RELAXED);
+    if(v<0) { unsigned r[4],m; ch_cpuid(0,0,r); m=r[0];
+        v=r[1]==0x756e6547u && r[3]==0x49656e69u && r[2]==0x6c65746eu;
+        if(v) { if(m>=7) { ch_cpuid(7,0,r); v=(r[1]>>19)&1; } else v=0; }
+        __atomic_store_n(&cache,v,__ATOMIC_RELAXED); }
+    return v;
+}
+#endif
 static inline ch_raw ch_prod(uint64_t a,uint64_t b,int backend) {
 #if defined(CH_X86) || defined(CH_ARM)
     if(backend) return ch_hwprod(a,b);
@@ -223,13 +236,30 @@ CH_T128 static inline __m128i ch_vreduce(__m128i a) {
     __m128i t=_mm_clmulepi64_si128(a,r,0x11),u=_mm_clmulepi64_si128(t,r,0x11);
     return _mm_xor_si128(a,_mm_xor_si128(t,u));
 }
-CH_T128 static uint64_t ch_fastfinish(const chainhash_key *k,uint64_t v) {
-    __m128i x=_mm_set_epi64x(0,(long long)(v+k->tau)),q=ch_vreduce(_mm_clmulepi64_si128(x,x,0));
-    __m128i a=_mm_xor_si128(q,_mm_set_epi64x(0,(long long)k->c[0])),b=_mm_xor_si128(_mm_xor_si128(x,q),_mm_set_epi64x(0,(long long)k->c[1]));
-    __m128i r=ch_vreduce(_mm_clmulepi64_si128(a,b,0));
-    r=ch_vreduce(_mm_clmulepi64_si128(_mm_xor_si128(x,_mm_set_epi64x(0,(long long)k->c[2])),_mm_xor_si128(r,_mm_set_epi64x(0,(long long)k->c[3])),0));
-    return ch_lane0(r)^k->c[4];
+/* Reduction of a 128-bit product by shifts, for latency-bound code: with h the high
+ * word and q = h>>63 ^ h>>61 ^ h>>60 (the bits h*27 carries past bit 63), lane 0 becomes
+ * lo ^ h*27 ^ q*27 as in ch_reduce. About 8 cycles on every x86 core and no PCLMULQDQ,
+ * against two dependent products in ch_vreduce. Lane 1 of the result is not meaningful. */
+CH_T128 static inline __m128i ch_vfold(__m128i a) {
+    __m128i h=_mm_unpackhi_epi64(a,a),q,r;
+    q=_mm_xor_si128(_mm_srli_epi64(h,63),_mm_xor_si128(_mm_srli_epi64(h,61),_mm_srli_epi64(h,60)));
+    r=_mm_xor_si128(_mm_xor_si128(a,h),_mm_xor_si128(_mm_slli_epi64(h,1),_mm_xor_si128(_mm_slli_epi64(h,3),_mm_slli_epi64(h,4))));
+    q=_mm_xor_si128(_mm_xor_si128(q,_mm_slli_epi64(q,1)),_mm_xor_si128(_mm_slli_epi64(q,3),_mm_slli_epi64(q,4)));
+    return _mm_xor_si128(r,q);
 }
+/* The finalizer on lane 0 of v; the high lanes of v and of every intermediate are
+ * ignored (every product selects a lane explicitly). The last product absorbs the
+ * reduction of its right factor: with z = x^c2, R the raw middle product and
+ * w = z*X^64 mod p (available early), z*(R^c3) = z*(R.lo^c3) ^ w*R.hi mod p. */
+CH_T128 static inline uint64_t ch_finish128(const chainhash_key *k,__m128i v) {
+    __m128i x=_mm_add_epi64(v,_mm_loadl_epi64((const __m128i *)&k->tau)),q=ch_vfold(_mm_clmulepi64_si128(x,x,0));
+    __m128i a=_mm_xor_si128(q,_mm_loadl_epi64((const __m128i *)&k->c[0])),b=_mm_xor_si128(_mm_xor_si128(x,q),_mm_loadl_epi64((const __m128i *)&k->c[1]));
+    __m128i z=_mm_xor_si128(x,_mm_loadl_epi64((const __m128i *)&k->c[2])),w=ch_vfold(_mm_slli_si128(z,8));
+    __m128i R=_mm_clmulepi64_si128(a,b,0);
+    __m128i r=_mm_xor_si128(_mm_clmulepi64_si128(z,_mm_xor_si128(R,_mm_loadl_epi64((const __m128i *)&k->c[3])),0x00),_mm_clmulepi64_si128(w,R,0x10));
+    return ch_lane0(ch_vfold(r))^k->c[4];
+}
+CH_T128 static uint64_t ch_fastfinish(const chainhash_key *k,uint64_t v) { return ch_finish128(k,_mm_set_epi64x(0,(long long)v)); }
 #elif defined(CH_ARM)
 CH_NBEGIN
 static inline uint64x2_t ch_vreduce(uint64x2_t a) { const uint64x2_t r=vdupq_n_u64(27); uint64x2_t t=ch_hh(a,r); return ch_xor3(a,t,ch_hh(t,r)); }
@@ -289,6 +319,68 @@ static inline void ch_region_scalar(const chainhash_key *k,const uint8_t *p,size
 }
 
 #ifdef CH_X86
+/* Loads for the partial final region: never outside the input. ch_ldend returns the
+ * avail (1..16) bytes that end at e, zero-extended; it reads e-16..e-1, so it needs 16
+ * input bytes before e. ch_ldsmall assembles a 1..15-byte input from overlapping loads. */
+static const uint8_t ch_shift_idx[32]={0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,
+    0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80};
+CH_T128 static inline __m128i ch_ldend(const uint8_t *e,size_t avail) {
+    return _mm_shuffle_epi8(_mm_loadu_si128((const __m128i_u *)(e-16)),_mm_loadu_si128((const __m128i_u *)(ch_shift_idx+16-avail)));
+}
+CH_T128 static inline __m128i ch_ldsmall(const uint8_t *p,size_t n) {
+    uint64_t lo,hi=0;
+    if(n>=8) { memcpy(&lo,p,8); if(n>8) { memcpy(&hi,p+n-8,8); hi>>=8*(16-n); } }
+    else if(n>=4) { uint32_t a,b; memcpy(&a,p,4); memcpy(&b,p+n-4,4); lo=a|(uint64_t)b<<(8*(n-4)); }
+    else lo=(uint64_t)p[0]|(uint64_t)p[n>>1]<<(8*(n>>1))|(uint64_t)p[n-1]<<(8*(n-1));
+    return _mm_set_epi64x((long long)hi,(long long)lo);
+}
+/* The 16 bytes at offset o of an n-byte input, zero-extended past n (o<n). */
+CH_T128 static inline __m128i ch_ldword(const uint8_t *p,size_t n,size_t o) {
+    if(n>=o+16) return _mm_loadu_si128((const __m128i_u *)(p+o));
+    return n>=16 ? ch_ldend(p+n,n-o) : ch_ldsmall(p,n);
+}
+/* Partial final region (n<1024) for the x86 backends, as ch_tail_neon: raw lane products,
+ * Horner weights (y^e, X^64 y^e) on raw lanes, one reduction, and the finalizer, all in
+ * vector registers. A pair is active iff its first word has a byte; an inactive second
+ * pair of a lane has its data vector's high half cleared. The Horner weights are loaded
+ * as single words and selected by the product immediate. */
+CH_T128 static inline __m128i ch_weigh(const chainhash_key *k,__m128i u,unsigned e) {
+    return _mm_xor_si128(_mm_clmulepi64_si128(u,_mm_loadl_epi64((const __m128i *)(k->yp+e)),0x00),
+                         _mm_clmulepi64_si128(u,_mm_loadl_epi64((const __m128i *)(k->yh+e)),0x01));
+}
+/* Up to 64 bytes every partner word is absent, so a pair is (word ^ kappa) * kappa'.
+ * Registers only: each lane is weighted as it is formed. */
+CH_T128 static inline uint64_t ch_short128(const chainhash_key *k,const uint8_t *p,size_t n,uint64_t leading) {
+    unsigned lanes=ch_lanes(n),j;
+    const __m128i ka=_mm_loadu_si128((const __m128i_u *)k->ph),kb=_mm_loadu_si128((const __m128i_u *)(k->ph+2));
+    __m128i acc=_mm_clmulepi64_si128(_mm_set_epi64x(0,(long long)leading),_mm_loadl_epi64((const __m128i *)(k->yp+lanes)),0);
+    for(j=0;j<lanes && 16*j<n;j++) {
+        __m128i a=_mm_xor_si128(ch_ldword(p,n,16*j),ka),u;
+        if(n<=16*j+8) a=_mm_move_epi64(a);
+        u=_mm_xor_si128(_mm_clmulepi64_si128(a,kb,0),_mm_clmulepi64_si128(a,kb,0x11));
+        acc=_mm_xor_si128(acc,j+1<lanes ? ch_weigh(k,u,lanes-1-j) : u);
+    }
+    return ch_finish128(k,ch_vfold(acc));
+}
+CH_T128 __attribute__((noinline)) static uint64_t ch_tail128(const chainhash_key *k,const uint8_t *p,size_t n,uint64_t leading) {
+    size_t full=n/128,rem=n%128; unsigned j,c;
+    __m128i acc,u[4]={_mm_setzero_si128(),_mm_setzero_si128(),_mm_setzero_si128(),_mm_setzero_si128()};
+    if(n<=64) return ch_short128(k,p,n,leading);
+    for(c=0;c<=full;c++) {
+        size_t take=c<full?128:rem; const uint8_t *q=p+128*c;
+        const __m128i ka=_mm_loadu_si128((const __m128i_u *)(k->ph+4*c)),kb=_mm_loadu_si128((const __m128i_u *)(k->ph+4*c+2));
+        for(j=0;j<4 && 16*j<take;j++) {
+            size_t o=16*j; __m128i a,b;
+            a=_mm_xor_si128(take==128 ? _mm_loadu_si128((const __m128i_u *)(q+o)) : ch_ldword(q,take,o),ka);
+            b=_mm_xor_si128(take==128 ? _mm_loadu_si128((const __m128i_u *)(q+64+o)) : take>64+o ? ch_ldword(q,take,64+o) : _mm_setzero_si128(),kb);
+            if(take<=o+8) a=_mm_move_epi64(a);
+            u[j]=_mm_xor_si128(u[j],_mm_xor_si128(_mm_clmulepi64_si128(a,b,0),_mm_clmulepi64_si128(a,b,0x11)));
+        }
+    }
+    acc=_mm_clmulepi64_si128(_mm_set_epi64x(0,(long long)leading),_mm_loadl_epi64((const __m128i *)(k->yp+4)),0);
+    acc=_mm_xor_si128(_mm_xor_si128(acc,ch_weigh(k,u[0],3)),_mm_xor_si128(ch_weigh(k,u[1],2),_mm_xor_si128(ch_weigh(k,u[2],1),u[3])));
+    return ch_finish128(k,ch_vfold(acc));
+}
 CH_T128 static inline void ch_region128(const chainhash_key *k,const uint8_t *p,ch_raw out[4]) {
     unsigned j; for(j=0;j<4;j+=1) {
     __m128i a=_mm_setzero_si128();
@@ -767,7 +859,12 @@ static inline uint64_t chainhash_portable(const chainhash_key *k,const void *dat
     } while(1);
     return ch_finish(k,v,0);
 }
-static inline uint64_t ch_hash(const chainhash_key *k,const void *data,size_t len,int backend,int hint,unsigned step,size_t dist) {
+#if defined(__GNUC__) || defined(__clang__)
+#define CH_NOINLINE __attribute__((noinline))
+#else
+#define CH_NOINLINE
+#endif
+static CH_NOINLINE uint64_t ch_hash_body(const chainhash_key *k,const void *data,size_t len,int backend,int hint,unsigned step,size_t dist) {
     const uint8_t *p=(const uint8_t *)data; size_t full=len/1024,n=len%1024; uint64_t v=len;
     assert(chainhash_has_backend(backend)); (void)hint; (void)step; (void)dist;
     if(full) {
@@ -785,12 +882,24 @@ static inline uint64_t ch_hash(const chainhash_key *k,const void *data,size_t le
         p+=full*1024;
     }
     #ifdef CH_X86
-    if(backend==3 && (n || !full)) return ch_finish(k,ch_tail512(k,p,n,v),backend);
+    /* The latency-bound XMM tail also serves ZMM for short tails: up to 64 bytes where
+     * PCLMULQDQ issues no faster than VPCLMULQDQ on ZMM (AMD, where one 512-bit product
+     * does the work of four 128-bit ones at the same rate), up to 768 where it issues
+     * every cycle (Intel). */
+    if(backend==3 && n>(ch_pclmul_fast() ? 768u : 64u)) return ch_finish(k,ch_tail512(k,p,n,v),backend);
+    if(backend && (n || !full)) return ch_tail128(k,p,n,v);
 #elif defined(CH_ARM)
     if(backend==4 && (n || !full)) return ch_tail_neon(k,p,n,v);
 #endif
     if(n || !full) { ch_raw c[4]; unsigned j; ch_region_scalar(k,p,n,c,backend); for(j=0;j<ch_lanes(n);j++) v=ch_fmul(v,k->yp[1],backend)^ch_reduce(c[j]); }
     return ch_finish(k,v,backend);
+}
+/* Inputs up to 64 bytes take the register-only path without the general body's frame. */
+static inline uint64_t ch_hash(const chainhash_key *k,const void *data,size_t len,int backend,int hint,unsigned step,size_t dist) {
+#ifdef CH_X86
+    if(len<=64 && backend) return ch_short128(k,(const uint8_t *)data,len,len);
+#endif
+    return ch_hash_body(k,data,len,backend,hint,step,dist);
 }
 static inline uint64_t chainhash_with_backend(const chainhash_key *k,const void *data,size_t len,int backend) { return ch_hash(k,data,len,backend,CH_PF_OFF,64,0); }
 static inline uint64_t chainhash(const chainhash_key *k,const void *data,size_t len) { return chainhash_with_backend(k,data,len,chainhash_backend()); }
