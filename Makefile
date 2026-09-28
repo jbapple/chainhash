@@ -20,7 +20,7 @@ RANDOM_CASES ?= 20000
 RANDOM_CASES_128 ?= 20000
 
 TESTS = compile frozen schedule vectors guard key_alignment property schedule_knobs
-TESTS_128 = compile frozen schedule arithmetic vectors edges guard short property
+TESTS_128 = compile frozen schedule arithmetic vectors edges guard short property schedule_knobs
 BINS = $(addprefix build/64-,$(TESTS))
 BINS_128 = $(addprefix build/128-,$(TESTS_128))
 
@@ -92,6 +92,8 @@ test-128: $(BINS_128) $(addsuffix -portable,$(BINS_128)) build/128-cpp
 	./build/128-short-portable
 	./build/128-property $(RANDOM_CASES_128)
 	./build/128-property-portable $(RANDOM_CASES_128)
+	./build/128-schedule_knobs $(RANDOM_CASES_128)
+	./build/128-schedule_knobs-portable 1000
 sanitize-128: | build
 	$(CC) $(CPPFLAGS) -std=c99 $(SANITIZE) $(ARCH_FLAGS) test/128/guard.c -o build/128-guard-sanitize
 	./build/128-guard-sanitize
@@ -99,6 +101,8 @@ sanitize-128: | build
 	./build/128-short-sanitize
 	$(CC) $(CPPFLAGS) -std=c99 $(SANITIZE) $(ARCH_FLAGS) -pthread test/128/property.c -o build/128-property-sanitize
 	./build/128-property-sanitize 1000
+	$(CC) $(CPPFLAGS) -std=c99 -Wno-overlength-strings $(SANITIZE) $(ARCH_FLAGS) test/128/schedule_knobs.c -o build/128-schedule_knobs-sanitize
+	./build/128-schedule_knobs-sanitize 1500
 
 # Regenerate the frozen vectors with the independent evaluators and compare them
 # with the archives. The archives are never overwritten.

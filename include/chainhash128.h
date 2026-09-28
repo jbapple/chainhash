@@ -93,7 +93,7 @@ static inline ch128_word ch128_reduce(ch128_raw a) {
 static inline int ch128_detect(void) {
     unsigned a,b,c,d,l,h;
     if(!__get_cpuid(1,&a,&b,&c,&d) || (c&((1u<<1)|(1u<<27)|(1u<<28)))!=((1u<<1)|(1u<<27)|(1u<<28))) return 0;
-    __asm__("xgetbv":"=a"(l),"=d"(h):"c"(0)); if((l&6)!=6) return 0;
+    __asm__ volatile("xgetbv":"=a"(l),"=d"(h):"c"(0)); if((l&6)!=6) return 0;
     if(!__get_cpuid_count(7,0,&a,&b,&c,&d) || !(b&(1u<<5)) || !(c&(1u<<10))) return 1;
     return (l&0xe6)==0xe6 && (b&(1u<<16)) ? 3:2;
 }
@@ -111,6 +111,24 @@ static inline int chainhash128_backend(void) {
 #endif
 }
 static inline int chainhash128_has_backend(int b) { int h=chainhash128_backend(); return b==0 || (h==4 ? b==4 : b>0 && b<=h); }
+/* Software prefetch in the x86 bulk kernels, as in chainhash.h: hint CH_PF_T0/T1/NTA
+ * every step bytes of the region dist bytes ahead, formed only inside the input; no
+ * setting changes a digest. The pinned NEON kernels take no hints (compute-bound). */
+#ifndef CHAINHASH_PF_HINTS
+#define CHAINHASH_PF_HINTS
+enum { CH_PF_OFF=0, CH_PF_T0=1, CH_PF_T1=2, CH_PF_NTA=3 };
+#endif
+#ifdef CH128_X86
+#define CH128_INLINE static inline __attribute__((always_inline))
+#define CH128_PREFETCH(p,regions,bytes,hint,step,dist) do { if((hint) && (dist)<=((regions)-1)*(size_t)(bytes)) { unsigned o_; \
+    for(o_=0;o_<(bytes);o_+=(step)) { const char *q_=(const char *)(p)+(dist)+o_; \
+        if((hint)==CH_PF_T0) __builtin_prefetch(q_,0,3); else if((hint)==CH_PF_T1) __builtin_prefetch(q_,0,2); else __builtin_prefetch(q_,0,0); } } } while(0)
+#define CH128_PF_SWITCH(NAME,...) switch(hint*2+(step==128)) { \
+    case 2: return NAME##_run(__VA_ARGS__,CH_PF_T0,64,dist);  case 3: return NAME##_run(__VA_ARGS__,CH_PF_T0,128,dist); \
+    case 4: return NAME##_run(__VA_ARGS__,CH_PF_T1,64,dist);  case 5: return NAME##_run(__VA_ARGS__,CH_PF_T1,128,dist); \
+    case 6: return NAME##_run(__VA_ARGS__,CH_PF_NTA,64,dist); case 7: return NAME##_run(__VA_ARGS__,CH_PF_NTA,128,dist); \
+    default: return NAME##_run(__VA_ARGS__,CH_PF_OFF,64,0); }
+#endif
 
 #ifdef CH128_X86
 CH128_T128 static inline __m128i ch128_128_ll(__m128i a,__m128i b) { return _mm_clmulepi64_si128(a,b,0); }
@@ -200,6 +218,13 @@ CH128_T512 static inline ch128_512_raw ch128_512_pack(ch128_512_acc a,int school
     r.lo=ch128_512_xor(a.l,ch128_512_left(a.m)); r.hi=ch128_512_xor(a.h,ch128_512_right(a.m)); return r;
 }
 CH128_T512 static inline ch128_512_raw ch128_512_prod(__m512i a,__m512i b,int school) { return ch128_512_pack(ch128_512_accum(ch128_512_azero(),a,b,school),school); }
+/* N consecutive raw lane states (a stream's) as one vector state. */
+#define CH128_XIN(P,T,N) T static inline P##_raw P##_in(const ch128_raw *st) { \
+    ch128_word lo[N],hi[N]; unsigned t; P##_raw r; for(t=0;t<N;t++) { lo[t]=st[t].lo; hi[t]=st[t].hi; } r.lo=P##_load(lo); r.hi=P##_load(hi); return r; }
+CH128_XIN(ch128_128,CH128_T128,1)
+CH128_XIN(ch128_256,CH128_T256,2)
+CH128_XIN(ch128_512,CH128_T512,4)
+#undef CH128_XIN
 #endif
 
 #ifdef CH128_ARM
@@ -377,7 +402,7 @@ CH128_T128 static void ch128_128_region(const chainhash128_key *k,const uint8_t 
         r=ch128_128_pack(a,school); { ch128_word lo[1],hi[1]; unsigned t; ch128_128_store(lo,r.lo); ch128_128_store(hi,r.hi); for(t=0;t<1;t++) { out[j+t].lo=lo[t]; out[j+t].hi=hi[t]; } }
     }
 }
-CH128_T128 static ch128_word ch128_128_bulk0(const chainhash128_key *k,const uint8_t *p,size_t regions,size_t len) {
+CH128_T128 CH128_INLINE ch128_word ch128_128_bulk0_run(const chainhash128_key *k,const uint8_t *p,size_t regions,size_t len,ch128_raw *st,const int hint,const unsigned step,size_t dist) {
     const __m128i y=ch128_128_bc(k->yp+8),h=ch128_128_bc(k->yh+8);
     ch128_128_raw s0; s0.lo=s0.hi=ch128_128_zero();
     ch128_128_raw s1; s1.lo=s1.hi=ch128_128_zero();
@@ -388,7 +413,9 @@ CH128_T128 static ch128_word ch128_128_bulk0(const chainhash128_key *k,const uin
     ch128_128_raw s6; s6.lo=s6.hi=ch128_128_zero();
     ch128_128_raw s7; s7.lo=s7.hi=ch128_128_zero();
     { ch128_word init[1]={ {0,0} }; init[0].lo=len; s7.lo=ch128_128_load(init); }
+    if(st) { s0=ch128_128_in(st); s1=ch128_128_in(st+1); s2=ch128_128_in(st+2); s3=ch128_128_in(st+3); s4=ch128_128_in(st+4); s5=ch128_128_in(st+5); s6=ch128_128_in(st+6); s7=ch128_128_in(st+7); }
     do {
+        CH128_PREFETCH(p,regions,CH128_REGION,hint,step,dist);
         { ch128_128_acc a=ch128_128_azero();
           a=ch128_128_accum(a,ch128_128_xor(ch128_128_load(p+0),ch128_128_bc(k->ph+0)),ch128_128_xor(ch128_128_load(p+128),ch128_128_bc(k->ph+1)),0);
           a=ch128_128_accum(a,ch128_128_xor(ch128_128_load(p+256),ch128_128_bc(k->ph+2)),ch128_128_xor(ch128_128_load(p+384),ch128_128_bc(k->ph+3)),0);
@@ -560,10 +587,11 @@ CH128_T128 static ch128_word ch128_128_bulk0(const chainhash128_key *k,const uin
       ch128_128_store(lo+5,s5.lo); ch128_128_store(hi+5,s5.hi);
       ch128_128_store(lo+6,s6.lo); ch128_128_store(hi+6,s6.hi);
       ch128_128_store(lo+7,s7.lo); ch128_128_store(hi+7,s7.hi);
+      if(st) { for(j=0;j<8;j++) { st[j].lo=lo[j]; st[j].hi=hi[j]; } return ch128_make(0,0); }
       for(j=0;j<8;j++) { acc=ch128_rxor(acc,ch128_prod(lo[j],k->yp[7-j],1,0)); acc=ch128_rxor(acc,ch128_prod(hi[j],k->yh[7-j],1,0)); }
       return ch128_reduce(acc); }
 }
-CH128_T128 static ch128_word ch128_128_bulk1(const chainhash128_key *k,const uint8_t *p,size_t regions,size_t len) {
+CH128_T128 CH128_INLINE ch128_word ch128_128_bulk1_run(const chainhash128_key *k,const uint8_t *p,size_t regions,size_t len,ch128_raw *st,const int hint,const unsigned step,size_t dist) {
     const __m128i y=ch128_128_bc(k->yp+8),h=ch128_128_bc(k->yh+8);
     ch128_128_raw s0; s0.lo=s0.hi=ch128_128_zero();
     ch128_128_raw s1; s1.lo=s1.hi=ch128_128_zero();
@@ -574,7 +602,9 @@ CH128_T128 static ch128_word ch128_128_bulk1(const chainhash128_key *k,const uin
     ch128_128_raw s6; s6.lo=s6.hi=ch128_128_zero();
     ch128_128_raw s7; s7.lo=s7.hi=ch128_128_zero();
     { ch128_word init[1]={ {0,0} }; init[0].lo=len; s7.lo=ch128_128_load(init); }
+    if(st) { s0=ch128_128_in(st); s1=ch128_128_in(st+1); s2=ch128_128_in(st+2); s3=ch128_128_in(st+3); s4=ch128_128_in(st+4); s5=ch128_128_in(st+5); s6=ch128_128_in(st+6); s7=ch128_128_in(st+7); }
     do {
+        CH128_PREFETCH(p,regions,CH128_REGION,hint,step,dist);
         { ch128_128_acc a=ch128_128_azero();
           a=ch128_128_accum(a,ch128_128_xor(ch128_128_load(p+0),ch128_128_bc(k->ph+0)),ch128_128_xor(ch128_128_load(p+128),ch128_128_bc(k->ph+1)),1);
           a=ch128_128_accum(a,ch128_128_xor(ch128_128_load(p+256),ch128_128_bc(k->ph+2)),ch128_128_xor(ch128_128_load(p+384),ch128_128_bc(k->ph+3)),1);
@@ -746,9 +776,13 @@ CH128_T128 static ch128_word ch128_128_bulk1(const chainhash128_key *k,const uin
       ch128_128_store(lo+5,s5.lo); ch128_128_store(hi+5,s5.hi);
       ch128_128_store(lo+6,s6.lo); ch128_128_store(hi+6,s6.hi);
       ch128_128_store(lo+7,s7.lo); ch128_128_store(hi+7,s7.hi);
+      if(st) { for(j=0;j<8;j++) { st[j].lo=lo[j]; st[j].hi=hi[j]; } return ch128_make(0,0); }
       for(j=0;j<8;j++) { acc=ch128_rxor(acc,ch128_prod(lo[j],k->yp[7-j],1,1)); acc=ch128_rxor(acc,ch128_prod(hi[j],k->yh[7-j],1,1)); }
       return ch128_reduce(acc); }
 }
+CH128_T128 static ch128_word ch128_128_bulk0(const chainhash128_key *k,const uint8_t *p,size_t regions,size_t len,ch128_raw *st) { return ch128_128_bulk0_run(k,p,regions,len,st,CH_PF_OFF,64,0); }
+CH128_T128 static ch128_word ch128_128_bulk1(const chainhash128_key *k,const uint8_t *p,size_t regions,size_t len,ch128_raw *st) { return ch128_128_bulk1_run(k,p,regions,len,st,CH_PF_OFF,64,0); }
+CH128_T128 static ch128_word ch128_128_pf(const chainhash128_key *k,const uint8_t *p,size_t regions,size_t len,ch128_raw *st,int hint,unsigned step,size_t dist) { CH128_PF_SWITCH(ch128_128_bulk1,k,p,regions,len,st) }
 #endif
 
 #ifdef CH128_X86
@@ -758,14 +792,16 @@ CH128_T256 static void ch128_256_region(const chainhash128_key *k,const uint8_t 
         r=ch128_256_pack(a,school); { ch128_word lo[2],hi[2]; unsigned t; ch128_256_store(lo,r.lo); ch128_256_store(hi,r.hi); for(t=0;t<2;t++) { out[j+t].lo=lo[t]; out[j+t].hi=hi[t]; } }
     }
 }
-CH128_T256 static ch128_word ch128_256_bulk0(const chainhash128_key *k,const uint8_t *p,size_t regions,size_t len) {
+CH128_T256 CH128_INLINE ch128_word ch128_256_bulk0_run(const chainhash128_key *k,const uint8_t *p,size_t regions,size_t len,ch128_raw *st,const int hint,const unsigned step,size_t dist) {
     const __m256i y=ch128_256_bc(k->yp+8),h=ch128_256_bc(k->yh+8);
     ch128_256_raw s0; s0.lo=s0.hi=ch128_256_zero();
     ch128_256_raw s1; s1.lo=s1.hi=ch128_256_zero();
     ch128_256_raw s2; s2.lo=s2.hi=ch128_256_zero();
     ch128_256_raw s3; s3.lo=s3.hi=ch128_256_zero();
     { ch128_word init[2]={ {0,0} }; init[1].lo=len; s3.lo=ch128_256_load(init); }
+    if(st) { s0=ch128_256_in(st); s1=ch128_256_in(st+2); s2=ch128_256_in(st+4); s3=ch128_256_in(st+6); }
     do {
+        CH128_PREFETCH(p,regions,CH128_REGION,hint,step,dist);
         { ch128_256_acc a=ch128_256_azero();
           a=ch128_256_accum(a,ch128_256_xor(ch128_256_load(p+0),ch128_256_bc(k->ph+0)),ch128_256_xor(ch128_256_load(p+128),ch128_256_bc(k->ph+1)),0);
           a=ch128_256_accum(a,ch128_256_xor(ch128_256_load(p+256),ch128_256_bc(k->ph+2)),ch128_256_xor(ch128_256_load(p+384),ch128_256_bc(k->ph+3)),0);
@@ -853,17 +889,20 @@ CH128_T256 static ch128_word ch128_256_bulk0(const chainhash128_key *k,const uin
       ch128_256_store(lo+2,s1.lo); ch128_256_store(hi+2,s1.hi);
       ch128_256_store(lo+4,s2.lo); ch128_256_store(hi+4,s2.hi);
       ch128_256_store(lo+6,s3.lo); ch128_256_store(hi+6,s3.hi);
+      if(st) { for(j=0;j<8;j++) { st[j].lo=lo[j]; st[j].hi=hi[j]; } return ch128_make(0,0); }
       for(j=0;j<8;j++) { acc=ch128_rxor(acc,ch128_prod(lo[j],k->yp[7-j],1,0)); acc=ch128_rxor(acc,ch128_prod(hi[j],k->yh[7-j],1,0)); }
       return ch128_reduce(acc); }
 }
-CH128_T256 static ch128_word ch128_256_bulk1(const chainhash128_key *k,const uint8_t *p,size_t regions,size_t len) {
+CH128_T256 CH128_INLINE ch128_word ch128_256_bulk1_run(const chainhash128_key *k,const uint8_t *p,size_t regions,size_t len,ch128_raw *st,const int hint,const unsigned step,size_t dist) {
     const __m256i y=ch128_256_bc(k->yp+8),h=ch128_256_bc(k->yh+8);
     ch128_256_raw s0; s0.lo=s0.hi=ch128_256_zero();
     ch128_256_raw s1; s1.lo=s1.hi=ch128_256_zero();
     ch128_256_raw s2; s2.lo=s2.hi=ch128_256_zero();
     ch128_256_raw s3; s3.lo=s3.hi=ch128_256_zero();
     { ch128_word init[2]={ {0,0} }; init[1].lo=len; s3.lo=ch128_256_load(init); }
+    if(st) { s0=ch128_256_in(st); s1=ch128_256_in(st+2); s2=ch128_256_in(st+4); s3=ch128_256_in(st+6); }
     do {
+        CH128_PREFETCH(p,regions,CH128_REGION,hint,step,dist);
         { ch128_256_acc a=ch128_256_azero();
           a=ch128_256_accum(a,ch128_256_xor(ch128_256_load(p+0),ch128_256_bc(k->ph+0)),ch128_256_xor(ch128_256_load(p+128),ch128_256_bc(k->ph+1)),1);
           a=ch128_256_accum(a,ch128_256_xor(ch128_256_load(p+256),ch128_256_bc(k->ph+2)),ch128_256_xor(ch128_256_load(p+384),ch128_256_bc(k->ph+3)),1);
@@ -951,9 +990,13 @@ CH128_T256 static ch128_word ch128_256_bulk1(const chainhash128_key *k,const uin
       ch128_256_store(lo+2,s1.lo); ch128_256_store(hi+2,s1.hi);
       ch128_256_store(lo+4,s2.lo); ch128_256_store(hi+4,s2.hi);
       ch128_256_store(lo+6,s3.lo); ch128_256_store(hi+6,s3.hi);
+      if(st) { for(j=0;j<8;j++) { st[j].lo=lo[j]; st[j].hi=hi[j]; } return ch128_make(0,0); }
       for(j=0;j<8;j++) { acc=ch128_rxor(acc,ch128_prod(lo[j],k->yp[7-j],1,1)); acc=ch128_rxor(acc,ch128_prod(hi[j],k->yh[7-j],1,1)); }
       return ch128_reduce(acc); }
 }
+CH128_T256 static ch128_word ch128_256_bulk0(const chainhash128_key *k,const uint8_t *p,size_t regions,size_t len,ch128_raw *st) { return ch128_256_bulk0_run(k,p,regions,len,st,CH_PF_OFF,64,0); }
+CH128_T256 static ch128_word ch128_256_bulk1(const chainhash128_key *k,const uint8_t *p,size_t regions,size_t len,ch128_raw *st) { return ch128_256_bulk1_run(k,p,regions,len,st,CH_PF_OFF,64,0); }
+CH128_T256 static ch128_word ch128_256_pf(const chainhash128_key *k,const uint8_t *p,size_t regions,size_t len,ch128_raw *st,int hint,unsigned step,size_t dist) { CH128_PF_SWITCH(ch128_256_bulk0,k,p,regions,len,st) }
 #endif
 
 #ifdef CH128_X86
@@ -963,10 +1006,12 @@ CH128_T512 static void ch128_512_region(const chainhash128_key *k,const uint8_t 
         r=ch128_512_pack(a,school); { ch128_word lo[4],hi[4]; unsigned t; ch128_512_store(lo,r.lo); ch128_512_store(hi,r.hi); for(t=0;t<4;t++) { out[j+t].lo=lo[t]; out[j+t].hi=hi[t]; } }
     }
 }
-CH128_T512 static ch128_word ch128_512_bulk0(const chainhash128_key *k,const uint8_t *p,size_t regions,size_t len) {
+CH128_T512 CH128_INLINE ch128_word ch128_512_bulk0_run(const chainhash128_key *k,const uint8_t *p,size_t regions,size_t len,ch128_raw *st,const int hint,const unsigned step,size_t dist) {
     const __m512i y=ch128_512_bc(k->yp+4),h=ch128_512_bc(k->yh+4);
     ch128_512_raw state; ch128_word init[4]={{0,0}}; init[3].lo=len; state.lo=ch128_512_load(init);state.hi=ch128_512_zero();
+    if(st) state=ch128_512_in(st);
     do {
+        CH128_PREFETCH(p,regions,CH128_REGION,hint,step,dist);
       { ch128_512_acc a=ch128_512_azero();
         a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+0),ch128_512_bc(k->ph+0)),ch128_512_xor(ch128_512_load(p+128),ch128_512_bc(k->ph+1)),0);
         a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+256),ch128_512_bc(k->ph+2)),ch128_512_xor(ch128_512_load(p+384),ch128_512_bc(k->ph+3)),0);
@@ -1011,13 +1056,16 @@ CH128_T512 static ch128_word ch128_512_bulk0(const chainhash128_key *k,const uin
     } while(--regions);
     { ch128_raw acc={{0,0},{0,0}}; ch128_word lo[4],hi[4]; unsigned j;
       ch128_512_store(lo,state.lo);ch128_512_store(hi,state.hi);
+      if(st) { for(j=0;j<4;j++) { st[j].lo=lo[j]; st[j].hi=hi[j]; } return ch128_make(0,0); }
       for(j=0;j<4;j++) {acc=ch128_rxor(acc,ch128_prod(lo[j],k->yp[3-j],1,0));acc=ch128_rxor(acc,ch128_prod(hi[j],k->yh[3-j],1,0));}return ch128_reduce(acc);
     }
 }
-CH128_T512 static ch128_word ch128_512_bulk1(const chainhash128_key *k,const uint8_t *p,size_t regions,size_t len) {
+CH128_T512 CH128_INLINE ch128_word ch128_512_bulk1_run(const chainhash128_key *k,const uint8_t *p,size_t regions,size_t len,ch128_raw *st,const int hint,const unsigned step,size_t dist) {
     const __m512i y=ch128_512_bc(k->yp+4),h=ch128_512_bc(k->yh+4);
     ch128_512_raw state; ch128_word init[4]={{0,0}}; init[3].lo=len; state.lo=ch128_512_load(init);state.hi=ch128_512_zero();
+    if(st) state=ch128_512_in(st);
     do {
+        CH128_PREFETCH(p,regions,CH128_REGION,hint,step,dist);
       { ch128_512_acc a=ch128_512_azero();
         a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+0),ch128_512_bc(k->ph+0)),ch128_512_xor(ch128_512_load(p+128),ch128_512_bc(k->ph+1)),1);
         a=ch128_512_accum(a,ch128_512_xor(ch128_512_load(p+256),ch128_512_bc(k->ph+2)),ch128_512_xor(ch128_512_load(p+384),ch128_512_bc(k->ph+3)),1);
@@ -1062,9 +1110,13 @@ CH128_T512 static ch128_word ch128_512_bulk1(const chainhash128_key *k,const uin
     } while(--regions);
     { ch128_raw acc={{0,0},{0,0}}; ch128_word lo[4],hi[4]; unsigned j;
       ch128_512_store(lo,state.lo);ch128_512_store(hi,state.hi);
+      if(st) { for(j=0;j<4;j++) { st[j].lo=lo[j]; st[j].hi=hi[j]; } return ch128_make(0,0); }
       for(j=0;j<4;j++) {acc=ch128_rxor(acc,ch128_prod(lo[j],k->yp[3-j],1,1));acc=ch128_rxor(acc,ch128_prod(hi[j],k->yh[3-j],1,1));}return ch128_reduce(acc);
     }
 }
+CH128_T512 static ch128_word ch128_512_bulk0(const chainhash128_key *k,const uint8_t *p,size_t regions,size_t len,ch128_raw *st) { return ch128_512_bulk0_run(k,p,regions,len,st,CH_PF_OFF,64,0); }
+CH128_T512 static ch128_word ch128_512_bulk1(const chainhash128_key *k,const uint8_t *p,size_t regions,size_t len,ch128_raw *st) { return ch128_512_bulk1_run(k,p,regions,len,st,CH_PF_OFF,64,0); }
+CH128_T512 static ch128_word ch128_512_pf(const chainhash128_key *k,const uint8_t *p,size_t regions,size_t len,ch128_raw *st,int hint,unsigned step,size_t dist) { CH128_PF_SWITCH(ch128_512_bulk1,k,p,regions,len,st) }
 #endif
 
 #ifdef CH128_ARM
@@ -1386,18 +1438,13 @@ static void ch128_n_region(const chainhash128_key *k,const uint8_t *p,ch128_raw 
  * v0..v7: raw states; v8..v19: three-component block accumulators;
  * v20..v27: four word pairs; v28/v29: keys; v30/v31: scratch.
  * No hot-loop stack spills or vector-to-integer transfers are possible. */
-static __attribute__((noinline)) ch128_word ch128_n_bulk0(const chainhash128_key *k,const uint8_t *p,size_t regions,size_t len) {
+static __attribute__((noinline)) ch128_word ch128_n_bulk0(const chainhash128_key *k,const uint8_t *p,size_t regions,size_t len,ch128_raw *st) {
     ch128_raw state[4],acc={{0,0},{0,0}};uint8_t *out=(uint8_t *)state;unsigned j;
+    if(st) memcpy(state,st,sizeof(state)); else { memset(state,0,sizeof(state)); state[3].lo.lo=len; }
     __asm__ volatile(
-      "movi v0.2d,#0\n\t"
-      "movi v1.2d,#0\n\t"
-      "movi v2.2d,#0\n\t"
-      "movi v3.2d,#0\n\t"
-      "movi v4.2d,#0\n\t"
-      "movi v5.2d,#0\n\t"
-      "movi v6.2d,#0\n\t"
-      "movi v7.2d,#0\n\t"
-      "fmov d6,%[len]\n\t"
+      "add x9,%[out],#64\n\t"
+      "ld1 {v0.2d,v1.2d,v2.2d,v3.2d},[%[out]]\n\t"
+      "ld1 {v4.2d,v5.2d,v6.2d,v7.2d},[x9]\n\t"
       "1:\n\t"
       "movi v8.2d,#0\n\t"
       "movi v9.2d,#0\n\t"
@@ -1473,8 +1520,9 @@ static __attribute__((noinline)) ch128_word ch128_n_bulk0(const chainhash128_key
       "st1 {v0.2d,v1.2d,v2.2d,v3.2d},[%[out]],#64\n\t"
       "st1 {v4.2d,v5.2d,v6.2d,v7.2d},[%[out]]\n\t"
       : [p] "+&r"(p),[count] "+&r"(regions),[out] "+&r"(out)
-      : [key] "r"(k->ph),[yp] "r"(k->yp+4),[yh] "r"(k->yh+4),[len] "r"((uint64_t)len),[rb] "I"(CH128_REGION)
+      : [key] "r"(k->ph),[yp] "r"(k->yp+4),[yh] "r"(k->yh+4),[rb] "I"(CH128_REGION)
       : "x9","x10","x11","cc","memory","v0","v1","v2","v3","v4","v5","v6","v7","v8","v9","v10","v11","v12","v13","v14","v15","v16","v17","v18","v19","v20","v21","v22","v23","v24","v25","v26","v27","v28","v29","v30","v31");
+    if(st) { memcpy(st,state,sizeof(state)); return ch128_make(0,0); }
     for(j=0;j<4;j++) {acc=ch128_rxor(acc,ch128_prod(state[j].lo,k->yp[3-j],4,0));acc=ch128_rxor(acc,ch128_prod(state[j].hi,k->yh[3-j],4,0));}return ch128_reduce(acc);
 }
 /* Four fixed lazy chains. LD1 lists consume each comb half directly.
@@ -1527,18 +1575,13 @@ static __attribute__((noinline)) ch128_word ch128_n_bulk0(const chainhash128_key
       CH128_NPAIR2(48,176,304,432,17,18,19) \
       "add x9,x9,#512\n\t" \
       "add x11,x11,#64\n\t"
-static __attribute__((noinline)) ch128_word ch128_n_bulk1(const chainhash128_key *k,const uint8_t *p,size_t regions,size_t len) {
+static __attribute__((noinline)) ch128_word ch128_n_bulk1(const chainhash128_key *k,const uint8_t *p,size_t regions,size_t len,ch128_raw *st) {
     ch128_raw state[4],acc={{0,0},{0,0}};uint8_t *out=(uint8_t *)state;unsigned j;
+    if(st) memcpy(state,st,sizeof(state)); else { memset(state,0,sizeof(state)); state[3].lo.lo=len; }
     __asm__ volatile(
-      "movi v0.2d,#0\n\t"
-      "movi v1.2d,#0\n\t"
-      "movi v2.2d,#0\n\t"
-      "movi v3.2d,#0\n\t"
-      "movi v4.2d,#0\n\t"
-      "movi v5.2d,#0\n\t"
-      "movi v6.2d,#0\n\t"
-      "movi v7.2d,#0\n\t"
-      "fmov d6,%[len]\n\t"
+      "add x9,%[out],#64\n\t"
+      "ld1 {v0.2d,v1.2d,v2.2d,v3.2d},[%[out]]\n\t"
+      "ld1 {v4.2d,v5.2d,v6.2d,v7.2d},[x9]\n\t"
       "1:\n\t"
       "movi v8.2d,#0\n\t"
       "movi v9.2d,#0\n\t"
@@ -1596,8 +1639,9 @@ static __attribute__((noinline)) ch128_word ch128_n_bulk1(const chainhash128_key
       "st1 {v0.2d,v1.2d,v2.2d,v3.2d},[%[out]],#64\n\t"
       "st1 {v4.2d,v5.2d,v6.2d,v7.2d},[%[out]]\n\t"
       : [p] "+&r"(p),[count] "+&r"(regions),[out] "+&r"(out)
-      : [key] "r"(k->ph),[yp] "r"(k->yp+4),[yh] "r"(k->yh+4),[len] "r"((uint64_t)len),[rb] "I"(CH128_REGION)
+      : [key] "r"(k->ph),[yp] "r"(k->yp+4),[yh] "r"(k->yh+4),[rb] "I"(CH128_REGION)
       : "x9","x10","x11","cc","memory","v0","v1","v2","v3","v4","v5","v6","v7","v8","v9","v10","v11","v12","v13","v14","v15","v16","v17","v18","v19","v20","v21","v22","v23","v24","v25","v26","v27","v28","v29","v30","v31");
+    if(st) { memcpy(st,state,sizeof(state)); return ch128_make(0,0); }
     for(j=0;j<4;j++) {acc=ch128_rxor(acc,ch128_prod(state[j].lo,k->yp[3-j],4,1));acc=ch128_rxor(acc,ch128_prod(state[j].hi,k->yh[3-j],4,1));}return ch128_reduce(acc);
 }
 #undef CH128_NX3
@@ -1644,9 +1688,30 @@ static inline void ch128_absorb(chainhash128_stream *s,const uint8_t *p,size_t n
         ++s->blocks;
     }
 }
+/* Whole regions of a stream whose stride is the bulk kernel's chain count (8 on
+ * XMM/YMM, 4 on ZMM/NEON) run through the kernel, which starts from the stream's
+ * raw states and writes them back (eager states are reduced again). */
+static inline int ch128_stream_bulk(chainhash128_stream *s,const uint8_t *p,size_t regions) {
+#if defined(CH128_X86) || defined(CH128_ARM)
+    const chainhash128_key *k=s->key; int b=s->backend,m=s->school; ch128_raw *st=s->state; unsigned j,lanes=b==CH128_XMM || b==CH128_YMM ? 8 : 4;
+    if(!b || s->stride!=lanes || s->blocks%lanes) return 0;
+#ifdef CH128_X86
+    if(b==3) { if(m) ch128_512_bulk1(k,p,regions,0,st); else ch128_512_bulk0(k,p,regions,0,st); }
+    else if(b==2) { if(m) ch128_256_bulk1(k,p,regions,0,st); else ch128_256_bulk0(k,p,regions,0,st); }
+    else { if(m) ch128_128_bulk1(k,p,regions,0,st); else ch128_128_bulk0(k,p,regions,0,st); }
+#else
+    if(m) ch128_n_bulk1(k,p,regions,0,st); else ch128_n_bulk0(k,p,regions,0,st);
+#endif
+    if(!s->lazy) for(j=0;j<lanes;j++) { st[j].lo=ch128_reduce(st[j]); st[j].hi=ch128_make(0,0); }
+    s->blocks+=8*(uint64_t)regions; return 1;
+#else
+    (void)s; (void)p; (void)regions; return 0;
+#endif
+}
 static inline void chainhash128_update(chainhash128_stream *s,const void *data,size_t n) {
     const uint8_t *p=(const uint8_t *)data; assert(n<=UINT64_MAX-s->len); s->len+=n;
     if(s->used) { size_t take=CH128_REGION-s->used; if(take>n) take=n; if(take) { memcpy(s->buffer+s->used,p,take); p+=take; } s->used+=take; n-=take; if(s->used==CH128_REGION) { ch128_absorb(s,s->buffer,CH128_REGION); s->used=0; } }
+    if(n>=CH128_REGION && ch128_stream_bulk(s,p,n/CH128_REGION)) { p+=n/CH128_REGION*CH128_REGION; n%=CH128_REGION; }
     while(n>=CH128_REGION) { ch128_absorb(s,p,CH128_REGION); p+=CH128_REGION; n-=CH128_REGION; }
     if(n) { memcpy(s->buffer,p,n); s->used=n; }
 }
@@ -1741,9 +1806,9 @@ static inline ch128_word ch128_n_tail(const chainhash128_key *k,const uint8_t *p
     return v;
 }
 #endif
-static inline ch128_word chainhash128_with_backend(const chainhash128_key *k,const void *data,size_t len,int b,int school) {
+static inline ch128_word ch128_hash(const chainhash128_key *k,const void *data,size_t len,int b,int school,int hint,unsigned step,size_t dist) {
     const uint8_t *p=(const uint8_t *)data; size_t full=len/CH128_REGION,n=len%CH128_REGION; ch128_word v=ch128_make(len,0);
-    assert(chainhash128_has_backend(b)); assert(school==0 || school==1);
+    assert(chainhash128_has_backend(b)); assert(school==0 || school==1); (void)hint; (void)step; (void)dist;
 #ifdef CH128_X86
     if(b && len<=128) return ch128_128_short(k,p,len);
 #elif defined(CH128_ARM)
@@ -1751,12 +1816,12 @@ static inline ch128_word chainhash128_with_backend(const chainhash128_key *k,con
 #endif
     if(full) {
 #ifdef CH128_X86
-        if(b==3) v=school?ch128_512_bulk1(k,p,full,len):ch128_512_bulk0(k,p,full,len);
-        else if(b==2) v=school?ch128_256_bulk1(k,p,full,len):ch128_256_bulk0(k,p,full,len);
-        else if(b==1) v=school?ch128_128_bulk1(k,p,full,len):ch128_128_bulk0(k,p,full,len);
+        if(b==3) v=hint?ch128_512_pf(k,p,full,len,0,hint,step,dist):school?ch128_512_bulk1(k,p,full,len,0):ch128_512_bulk0(k,p,full,len,0);
+        else if(b==2) v=hint?ch128_256_pf(k,p,full,len,0,hint,step,dist):school?ch128_256_bulk1(k,p,full,len,0):ch128_256_bulk0(k,p,full,len,0);
+        else if(b==1) v=hint?ch128_128_pf(k,p,full,len,0,hint,step,dist):school?ch128_128_bulk1(k,p,full,len,0):ch128_128_bulk0(k,p,full,len,0);
         else return chainhash128_evaluate(k,data,len,8,1,b,school);
 #elif defined(CH128_ARM)
-        if(b==4) v=school?ch128_n_bulk1(k,p,full,len):ch128_n_bulk0(k,p,full,len);
+        if(b==4) v=school?ch128_n_bulk1(k,p,full,len,0):ch128_n_bulk0(k,p,full,len,0);
         else return chainhash128_evaluate(k,data,len,8,1,b,school);
 #else
         return chainhash128_evaluate(k,data,len,8,1,b,school);
@@ -1776,7 +1841,19 @@ static inline ch128_word chainhash128_with_backend(const chainhash128_key *k,con
     if(n || !full) { ch128_raw c[8]; unsigned j; ch128_region_scalar(k,p,n,c,b,school); for(j=0;j<ch128_lanes(n);j++) v=ch128_xor(ch128_mul(v,k->yp[1],b),ch128_reduce(c[j])); }
     return ch128_finish(k,v,b);
 }
+static inline ch128_word chainhash128_with_backend(const chainhash128_key *k,const void *data,size_t len,int b,int school) { return ch128_hash(k,data,len,b,school,CH_PF_OFF,64,0); }
 static inline ch128_word chainhash128(const chainhash128_key *k,const void *p,size_t n) { int b=chainhash128_backend(); return chainhash128_with_backend(k,p,n,b,b==CH128_XMM || b==CH128_ZMM || b==CH128_NEON); }
+/* chainhash128() with an explicit backend and software prefetch (CH_PF_*, every
+ * step = 64 or 128 bytes, dist bytes ahead; x86 only), with the backend's default
+ * product method. An unavailable backend falls back to the detected one. The digest
+ * is the same for every argument; chainhash_calibrate.h chooses them. */
+static inline ch128_word chainhash128_with_prefetch(const chainhash128_key *k,const void *data,size_t len,int b,int hint,unsigned step,size_t dist) {
+    if(!chainhash128_has_backend(b)) b=chainhash128_backend();
+#ifndef CH128_X86
+    hint=CH_PF_OFF;
+#endif
+    return ch128_hash(k,data,len,b,b==CH128_XMM || b==CH128_ZMM || b==CH128_NEON,hint>=CH_PF_T0 && hint<=CH_PF_NTA ? hint : CH_PF_OFF,step,dist);
+}
 static inline int chainhash128_selftest(void) {
     uint8_t m[CH128_REGION+1]; size_t n; chainhash128_key k=chainhash128_key_from_seed(123);
     for(n=0;n<sizeof(m);n++) m[n]=(uint8_t)(n*137+29);
