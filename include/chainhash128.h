@@ -329,16 +329,17 @@ static inline ch128_word ch128_n_finish(const chainhash128_key *k,uint64x2_t vv)
 /* For n<=128 every comb partner is absent. Factor its common key kb:
  * V = n*y^p + kb * Horner_y(w0+ka,...,w_(p-1)+ka). */
 static inline ch128_word ch128_n_short(const chainhash128_key *k,const uint8_t *p,size_t n) {
-    unsigned count=n?(unsigned)((n+15)/16):0,c,idx; uint64x2_t state=ch128_n_zero();
+    /* Power-weighted Horner: H = sum_j A_j*y^(count-1-j), every product accumulated lazily
+     * (unreduced) and H reduced once; words read from one zero-padded buffer, the length
+     * vector built in a register. Same V as the stride-4 chains (evaluation independence). */
+    unsigned count=n?(unsigned)((n+15)/16):0,j; uint64x2_t state=ch128_n_zero();
     if(count) {
-        ch128_word length={n,n};
-        uint64x2_t ka=ch128_n_load(k->ph),y4=ch128_n_load(k->yp+4),yp,lv,l,m,R[4],H; ch128_n_acc a;
-        for(c=0;c<4 && c<count;c++){ ch128_word w=ch128_partial(p,n,16*c); R[c]=ch128_n_xor(ch128_n_load(&w),ka); }
-        for(c=0;c<4;c++) for(idx=c+4; idx<count; idx+=4){ ch128_word w=ch128_partial(p,n,16*idx); R[c]=ch128_n_xor(ch128_n_mul(R[c],y4),ch128_n_xor(ch128_n_load(&w),ka)); }
-        H=ch128_n_zero();
-        for(c=0;c<4 && c<count;c++){ unsigned e=(count-1-c)&3; H=ch128_n_xor(H,e?ch128_n_mul(R[c],ch128_n_load(k->yp+e)):R[c]); }
+        uint8_t buf[128]; uint64x2_t ka=ch128_n_load(k->ph),yp,lv,l,m,H; ch128_n_acc a=ch128_n_azero(); ch128_n_raw r;
+        memset(buf,0,sizeof buf); memcpy(buf,p,n);
+        for(j=0;j+1<count;j++) a=ch128_n_accum(a,ch128_n_xor(vld1q_u64((const uint64_t *)(buf+16*j)),ka),ch128_n_load(k->yp+count-1-j),1);
+        r=ch128_n_pack(a,1); r.lo=ch128_n_xor(r.lo,ch128_n_xor(vld1q_u64((const uint64_t *)(buf+16*(count-1))),ka)); H=ch128_n_reduce(r);
         a=ch128_n_accum(ch128_n_azero(),H,ch128_n_load(k->ph+1),0);
-        yp=ch128_n_load(k->yp+count);lv=ch128_n_load(&length);
+        yp=ch128_n_load(k->yp+count);lv=vdupq_n_u64((uint64_t)n);   /* {n,n}: pmull2 supplies yp.hi*n for the Karatsuba middle term */
         l=ch128_n_ll(yp,lv);m=ch128_n_hh(yp,lv);
         a.l=ch128_n_xor(a.l,l);a.m=ch128_n_xor(a.m,ch128_n_xor(l,m));
         state=ch128_n_reduce(ch128_n_pack(a,0));
