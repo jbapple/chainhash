@@ -86,16 +86,22 @@ static inline ch128_word ch128_reduce(ch128_raw a) {
 #if !defined(CHAINHASH128_PORTABLE) && (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
 #define CH128_X86 1
 #include <immintrin.h>
-#include <cpuid.h>
 #define CH128_T128 __attribute__((target("avx,pclmul")))
 #define CH128_T256 __attribute__((target("avx2,pclmul,vpclmulqdq")))
 #define CH128_T512 __attribute__((target("avx2,pclmul,avx512f,vpclmulqdq")))
+/* CPUID by inline assembly: GCC 9's <cpuid.h> has no include guard, so a
+ * translation unit that included it twice (both ChainHash headers) failed. */
+static inline void ch128_cpuid(unsigned leaf,unsigned sub,unsigned r[4]) {
+    __asm__ __volatile__("cpuid":"=a"(r[0]),"=b"(r[1]),"=c"(r[2]),"=d"(r[3]):"a"(leaf),"c"(sub));
+}
 static inline int ch128_detect(void) {
-    unsigned a,b,c,d,l,h;
-    if(!__get_cpuid(1,&a,&b,&c,&d) || (c&((1u<<1)|(1u<<27)|(1u<<28)))!=((1u<<1)|(1u<<27)|(1u<<28))) return 0;
+    unsigned r[4],m,l,h;
+    ch128_cpuid(0,0,r); m=r[0]; if(m<1) return 0;
+    ch128_cpuid(1,0,r); if((r[2]&((1u<<1)|(1u<<27)|(1u<<28)))!=((1u<<1)|(1u<<27)|(1u<<28))) return 0;
     __asm__ volatile("xgetbv":"=a"(l),"=d"(h):"c"(0)); if((l&6)!=6) return 0;
-    if(!__get_cpuid_count(7,0,&a,&b,&c,&d) || !(b&(1u<<5)) || !(c&(1u<<10))) return 1;
-    return (l&0xe6)==0xe6 && (b&(1u<<16)) ? 3:2;
+    if(m<7) return 1;
+    ch128_cpuid(7,0,r); if(!(r[1]&(1u<<5)) || !(r[2]&(1u<<10))) return 1;
+    return (l&0xe6)==0xe6 && (r[1]&(1u<<16)) ? 3:2;
 }
 #elif !defined(CHAINHASH128_PORTABLE) && defined(__aarch64__) && !defined(__AARCH64EB__) && (defined(__GNUC__) || defined(__clang__))
 #define CH128_ARM 1

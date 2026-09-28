@@ -39,6 +39,7 @@
 #endif
 #if defined(CH_X86) || defined(CH128_X86)
 #define CHC_X86 1
+#include <cpuid.h>
 #endif
 
 #define CHAINHASH_AUTO 255                      /* knob backend: the detected one */
