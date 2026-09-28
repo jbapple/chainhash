@@ -411,9 +411,16 @@ CH128_T128 static inline __m128i ch128_128_reduce(ch128_128_raw p) {
     return ch128_128_xor(p.lo,ch128_128_xor(a,ch128_128_xor(ch128_128_left(b),fold)));
 }
 CH128_T128 static inline __m128i ch128_128_mul(__m128i a,__m128i b) { return ch128_128_reduce(ch128_128_prod(a,b,0)); }
+/* (a + b) mod 2^128 as integers, in a register: lane sums, then the low lane's carry,
+ * detected by an unsigned comparison through the sign-flipped signed one. */
+CH128_T128 static inline __m128i ch128_128_addint(__m128i a,__m128i b) {
+    const __m128i sign=_mm_set1_epi64x((long long)0x8000000000000000ull);
+    __m128i s=_mm_add_epi64(a,b),c=_mm_cmpgt_epi64(_mm_xor_si128(a,sign),_mm_xor_si128(s,sign));
+    return _mm_sub_epi64(s,_mm_slli_si128(c,8));
+}
 CH128_T128 static inline ch128_word ch128_128_finish(const chainhash128_key *k,__m128i vv) {
     ch128_word v; __m128i x,q,r; ch128_128_raw sq;
-    ch128_128_store(&v,vv);v=ch128_addint(v,k->tau);x=ch128_128_load(&v);
+    x=ch128_128_addint(vv,ch128_128_load(&k->tau));
     sq.lo=ch128_128_ll(x,x);sq.hi=ch128_128_hh(x,x);q=ch128_128_reduce(sq);
     r=ch128_128_mul(ch128_128_xor(q,ch128_128_load(k->c)),ch128_128_xor(ch128_128_xor(x,q),ch128_128_load(k->c+1)));
     r=ch128_128_xor(ch128_128_mul(ch128_128_xor(x,ch128_128_load(k->c+2)),ch128_128_xor(r,ch128_128_load(k->c+3))),ch128_128_load(k->c+4));
@@ -423,24 +430,40 @@ CH128_T128 static inline ch128_word ch128_128_finish(const chainhash128_key *k,_
  * V = n*y^p + kb * Horner_y(w0+ka,...,w_(p-1)+ka). */
 /* All partner words are absent through 128 bytes. Factor their common key
  * out of the Horner polynomial; the result is identical to separate blocks. */
+/* The 1..15 bytes at p, zero-extended, from overlapping in-bounds loads (no stack word). */
+CH128_T128 static inline __m128i ch128_128_ldsmall(const uint8_t *p,size_t n) {
+    uint64_t lo,hi=0;
+    if(n>=8) { memcpy(&lo,p,8); if(n>8) { memcpy(&hi,p+n-8,8); hi>>=8*(16-n); } }
+    else if(n>=4) { uint32_t a,b; memcpy(&a,p,4); memcpy(&b,p+n-4,4); lo=a|(uint64_t)b<<(8*(n-4)); }
+    else lo=(uint64_t)p[0]|(uint64_t)p[n>>1]<<(8*(n>>1))|(uint64_t)p[n-1]<<(8*(n-1));
+    return _mm_set_epi64x((long long)hi,(long long)lo);
+}
 CH128_T128 static inline ch128_word ch128_128_short(const chainhash128_key *k,const uint8_t *p,size_t n) {
     /* Power-weighted Horner: H = sum_j A_j*y^(count-1-j), every product accumulated lazily
      * (unreduced) and H reduced once; full words loaded in place, the last partial word as the
      * 16 bytes ending at p+n shifted down (no read outside the input), the length vector
-     * built in a register. Same V as the stride-4 chains (evaluation independence). */
+     * built in a register. Same V as the stride-4 chains (evaluation independence).
+     * Two words use V = n*y^2 + A_0*(kb*y) + A_1*kb instead: kb*y depends on the key only,
+     * so the data meet a single product level. */
     static const uint8_t shift_idx[32]={0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,
         0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80};
     unsigned count=n?(unsigned)((n+15)/16):0,j; __m128i state=ch128_128_zero();
     if(count) {
-        __m128i ka=ch128_128_load(k->ph),yp,lv,l,m,H,last; ch128_128_acc a=ch128_128_azero(); ch128_128_raw r;
+        __m128i ka=ch128_128_load(k->ph),kb=ch128_128_load(k->ph+1),yp,lv,l,m,H,last; ch128_128_acc a=ch128_128_azero(); ch128_128_raw r;
         size_t rem=n-16*(size_t)(count-1);
-        for(j=0;j+1<count;j++) a=ch128_128_accum(a,ch128_128_xor(ch128_128_load(p+16*j),ka),ch128_128_load(k->yp+count-1-j),1);
         if(rem==16) last=ch128_128_load(p+n-16);
         else if(n>=16) last=_mm_shuffle_epi8(ch128_128_load(p+n-16),ch128_128_load(shift_idx+16-rem));
-        else { ch128_word w=ch128_partial(p,n,0); last=ch128_128_load(&w); }
-        if(count==1) H=ch128_128_xor(last,ka);   /* one word: no product to reduce */
-        else { r=ch128_128_pack(a,1); r.lo=ch128_128_xor(r.lo,ch128_128_xor(last,ka)); H=ch128_128_reduce(r); }
-        a=ch128_128_accum(ch128_128_azero(),H,ch128_128_load(k->ph+1),0);
+        else last=ch128_128_ldsmall(p,n);
+        if(count==2) {
+            __m128i kby=ch128_128_mul(kb,ch128_128_load(k->yp+1));
+            a=ch128_128_accum(a,ch128_128_xor(ch128_128_load(p),ka),kby,0);
+            a=ch128_128_accum(a,ch128_128_xor(last,ka),kb,0);
+        } else {
+            for(j=0;j+1<count;j++) a=ch128_128_accum(a,ch128_128_xor(ch128_128_load(p+16*j),ka),ch128_128_load(k->yp+count-1-j),1);
+            if(count==1) H=ch128_128_xor(last,ka);   /* one word: no product to reduce */
+            else { r=ch128_128_pack(a,1); r.lo=ch128_128_xor(r.lo,ch128_128_xor(last,ka)); H=ch128_128_reduce(r); }
+            a=ch128_128_accum(ch128_128_azero(),H,kb,0);
+        }
         yp=ch128_128_load(k->yp+count);lv=_mm_set1_epi64x((long long)n);   /* {n,n}: the hh product supplies yp.hi*n for the Karatsuba middle term */
         l=ch128_128_ll(yp,lv);m=ch128_128_hh(yp,lv);
         a.l=ch128_128_xor(a.l,l);a.m=ch128_128_xor(a.m,ch128_128_xor(l,m));
