@@ -193,7 +193,7 @@ CH128_T512 static inline ch128_512_acc ch128_512_accum(ch128_512_acc r,__m512i a
     __m512i l=ch128_512_ll(a,b),h=ch128_512_hh(a,b),m;
     if(school) m=_mm512_ternarylogic_epi64(r.m,ch128_512_lh(a,b),ch128_512_hl(a,b),0x96);
     else m=ch128_512_ll(ch128_512_xor(a,ch128_512_swap(a)),ch128_512_xor(b,ch128_512_swap(b)));
-    r.l=ch128_512_xor(r.l,l); r.h=ch128_512_xor(r.h,h); r.m=school?m:ch128_512_xor(r.m,m); __asm__("" : "+v"(r.l), "+v"(r.h), "+v"(r.m)); return r;
+    r.l=ch128_512_xor(r.l,l); r.h=ch128_512_xor(r.h,h); r.m=school?m:ch128_512_xor(r.m,m); return r;
 }
 CH128_T512 static inline ch128_512_raw ch128_512_pack(ch128_512_acc a,int school) {
     ch128_512_raw r; if(!school) a.m=ch128_512_xor(a.m,ch128_512_xor(a.l,a.h));
