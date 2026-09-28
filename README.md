@@ -104,7 +104,9 @@ per-ISA entry points `chainhash_xmm/ymm/zmm/neon` exist only for the
   says whether an explicit `chainhash_with_backend(&key, data, len, b)`
   or `chainhash_xmm/ymm/zmm/neon` call is allowed, and `chainhash_portable`
   is always available. Define `CHAINHASH_PORTABLE` (`CHAINHASH128_PORTABLE`)
-  to compile without any hardware code. Every backend, stride, lazy or
+  to compile without any hardware code. `CHAINHASH_NEON_FUSE` (1 by default
+  on Apple targets) accumulates NEON products with fused `PMULL`+`EOR` pairs.
+  Every backend, stride, lazy or
   eager chain, chunking and split gives the same digest.
 - **Inputs.** Data may be unaligned; `NULL` is valid for an empty message;
   lengths up to `2^64 - 1` bytes. Words, keys and digests are little

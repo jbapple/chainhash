@@ -258,7 +258,9 @@ instruction and OS state support. XMM needs AVX and PCLMUL, YMM additionally
 AVX2 and VPCLMULQDQ, ZMM additionally AVX512F and enabled ZMM state.
 The detection cache uses relaxed atomics. AArch64 NEON needs crypto
 instructions enabled at build time; use `-march=native+crypto` on Apple or
-`-march=armv8-a+crypto` on other AArch64 hosts. Other/big-endian targets use
+`-march=armv8-a+crypto` on other AArch64 hosts. `CHAINHASH_NEON_FUSE` (default
+1 on Apple targets, 0 elsewhere) chooses fused PMULL+EOR accumulation over
+PMULL/PMULL2/EOR3; the digest is the same. Other/big-endian targets use
 portable C. `CHAINHASH_PORTABLE` removes all SIMD code.
 
 The long-input loop structure is inspired by Orson Peters's

@@ -90,6 +90,17 @@ CH_T128 static inline ch_raw ch_hwprod(uint64_t a,uint64_t b) {
 /* PMULL (FEAT_PMULL) is optional: without it at compile time the NEON code carries a
  * target attribute (CH_NBEGIN/CH_NEND) and the backend is NEON only on a CPU that
  * reports PMULL at run time (Linux HWCAP, Apple sysctl), portable otherwise. */
+/* NEON accumulation form: 1 accumulates every product with a PMULL/PMULL2 followed by
+ * an EOR into the product's register, which Apple cores issue as one fused operation;
+ * 0 uses PMULL, PMULL2 and EOR3 (fewer operations on cores that do not fuse the pair).
+ * Default: 1 on Apple targets. Same digest either way. */
+#ifndef CHAINHASH_NEON_FUSE
+#if defined(__APPLE__)
+#define CHAINHASH_NEON_FUSE 1
+#else
+#define CHAINHASH_NEON_FUSE 0
+#endif
+#endif
 #if defined(__ARM_FEATURE_AES) || defined(__ARM_FEATURE_CRYPTO)
 #define CH_PMULL 1
 #define CH_NBEGIN
@@ -132,6 +143,10 @@ static inline int ch_arm_has(unsigned long hwcap,const char *feat,const char *ol
 CH_NBEGIN
 static inline uint64x2_t ch_ll(uint64x2_t a,uint64x2_t b) { uint64x2_t r; __asm__("pmull %0.1q, %1.1d, %2.1d":"=w"(r):"w"(a),"w"(b)); return r; }
 static inline uint64x2_t ch_hh(uint64x2_t a,uint64x2_t b) { uint64x2_t r; __asm__("pmull2 %0.1q, %1.2d, %2.2d":"=w"(r):"w"(a),"w"(b)); return r; }
+/* acc^lo(a)*lo(b), acc^hi(a)*hi(b): the EOR writes its PMULL's destination right
+ * after it, which Apple cores issue as one fused operation. */
+static inline uint64x2_t ch_fll(uint64x2_t acc,uint64x2_t a,uint64x2_t b) { uint64x2_t r; __asm__("pmull %0.1q, %1.1d, %2.1d\n\teor %0.16b, %0.16b, %3.16b":"=&w"(r):"w"(a),"w"(b),"w"(acc)); return r; }
+static inline uint64x2_t ch_fhh(uint64x2_t acc,uint64x2_t a,uint64x2_t b) { uint64x2_t r; __asm__("pmull2 %0.1q, %1.2d, %2.2d\n\teor %0.16b, %0.16b, %3.16b":"=&w"(r):"w"(a),"w"(b),"w"(acc)); return r; }
 static inline uint64x2_t ch_xor3(uint64x2_t a,uint64x2_t b,uint64x2_t c) {
 #if defined(__ARM_FEATURE_SHA3)
     return veor3q_u64(a,b,c);
@@ -561,6 +576,43 @@ CH_INLINE uint64_t ch_bulk_neon_run(const chainhash_key *k,const uint8_t *p,size
     if(st) { s0=vld1q_u64(&st[0].lo); s1=vld1q_u64(&st[1].lo); s2=vld1q_u64(&st[2].lo); s3=vld1q_u64(&st[3].lo); }
     do {
         CH_PREFETCH(p,regions,1024,hint,step,dist);
+#if CHAINHASH_NEON_FUSE
+        /* Lane j keeps two chains, lo and hi products, each seeded with its half of s_j*y^4. */
+        uint64x2_t l0=ch_ll(s0,y),h0=ch_hh(s0,y),l1=ch_ll(s1,y),h1=ch_hh(s1,y),l2=ch_ll(s2,y),h2=ch_hh(s2,y),l3=ch_ll(s3,y),h3=ch_hh(s3,y);
+        { uint64x2_t a=veorq_u64(ch_ld(p+0),a0), b=veorq_u64(ch_ld(p+64),b0); l0=ch_fll(l0,a,b); h0=ch_fhh(h0,a,b); }
+        { uint64x2_t a=veorq_u64(ch_ld(p+16),a0), b=veorq_u64(ch_ld(p+80),b0); l1=ch_fll(l1,a,b); h1=ch_fhh(h1,a,b); }
+        { uint64x2_t a=veorq_u64(ch_ld(p+32),a0), b=veorq_u64(ch_ld(p+96),b0); l2=ch_fll(l2,a,b); h2=ch_fhh(h2,a,b); }
+        { uint64x2_t a=veorq_u64(ch_ld(p+48),a0), b=veorq_u64(ch_ld(p+112),b0); l3=ch_fll(l3,a,b); h3=ch_fhh(h3,a,b); }
+        { uint64x2_t a=veorq_u64(ch_ld(p+128),a1), b=veorq_u64(ch_ld(p+192),b1); l0=ch_fll(l0,a,b); h0=ch_fhh(h0,a,b); }
+        { uint64x2_t a=veorq_u64(ch_ld(p+144),a1), b=veorq_u64(ch_ld(p+208),b1); l1=ch_fll(l1,a,b); h1=ch_fhh(h1,a,b); }
+        { uint64x2_t a=veorq_u64(ch_ld(p+160),a1), b=veorq_u64(ch_ld(p+224),b1); l2=ch_fll(l2,a,b); h2=ch_fhh(h2,a,b); }
+        { uint64x2_t a=veorq_u64(ch_ld(p+176),a1), b=veorq_u64(ch_ld(p+240),b1); l3=ch_fll(l3,a,b); h3=ch_fhh(h3,a,b); }
+        { uint64x2_t a=veorq_u64(ch_ld(p+256),a2), b=veorq_u64(ch_ld(p+320),b2); l0=ch_fll(l0,a,b); h0=ch_fhh(h0,a,b); }
+        { uint64x2_t a=veorq_u64(ch_ld(p+272),a2), b=veorq_u64(ch_ld(p+336),b2); l1=ch_fll(l1,a,b); h1=ch_fhh(h1,a,b); }
+        { uint64x2_t a=veorq_u64(ch_ld(p+288),a2), b=veorq_u64(ch_ld(p+352),b2); l2=ch_fll(l2,a,b); h2=ch_fhh(h2,a,b); }
+        { uint64x2_t a=veorq_u64(ch_ld(p+304),a2), b=veorq_u64(ch_ld(p+368),b2); l3=ch_fll(l3,a,b); h3=ch_fhh(h3,a,b); }
+        { uint64x2_t a=veorq_u64(ch_ld(p+384),a3), b=veorq_u64(ch_ld(p+448),b3); l0=ch_fll(l0,a,b); h0=ch_fhh(h0,a,b); }
+        { uint64x2_t a=veorq_u64(ch_ld(p+400),a3), b=veorq_u64(ch_ld(p+464),b3); l1=ch_fll(l1,a,b); h1=ch_fhh(h1,a,b); }
+        { uint64x2_t a=veorq_u64(ch_ld(p+416),a3), b=veorq_u64(ch_ld(p+480),b3); l2=ch_fll(l2,a,b); h2=ch_fhh(h2,a,b); }
+        { uint64x2_t a=veorq_u64(ch_ld(p+432),a3), b=veorq_u64(ch_ld(p+496),b3); l3=ch_fll(l3,a,b); h3=ch_fhh(h3,a,b); }
+        { uint64x2_t a=veorq_u64(ch_ld(p+512),a4), b=veorq_u64(ch_ld(p+576),b4); l0=ch_fll(l0,a,b); h0=ch_fhh(h0,a,b); }
+        { uint64x2_t a=veorq_u64(ch_ld(p+528),a4), b=veorq_u64(ch_ld(p+592),b4); l1=ch_fll(l1,a,b); h1=ch_fhh(h1,a,b); }
+        { uint64x2_t a=veorq_u64(ch_ld(p+544),a4), b=veorq_u64(ch_ld(p+608),b4); l2=ch_fll(l2,a,b); h2=ch_fhh(h2,a,b); }
+        { uint64x2_t a=veorq_u64(ch_ld(p+560),a4), b=veorq_u64(ch_ld(p+624),b4); l3=ch_fll(l3,a,b); h3=ch_fhh(h3,a,b); }
+        { uint64x2_t a=veorq_u64(ch_ld(p+640),a5), b=veorq_u64(ch_ld(p+704),b5); l0=ch_fll(l0,a,b); h0=ch_fhh(h0,a,b); }
+        { uint64x2_t a=veorq_u64(ch_ld(p+656),a5), b=veorq_u64(ch_ld(p+720),b5); l1=ch_fll(l1,a,b); h1=ch_fhh(h1,a,b); }
+        { uint64x2_t a=veorq_u64(ch_ld(p+672),a5), b=veorq_u64(ch_ld(p+736),b5); l2=ch_fll(l2,a,b); h2=ch_fhh(h2,a,b); }
+        { uint64x2_t a=veorq_u64(ch_ld(p+688),a5), b=veorq_u64(ch_ld(p+752),b5); l3=ch_fll(l3,a,b); h3=ch_fhh(h3,a,b); }
+        { uint64x2_t a=veorq_u64(ch_ld(p+768),a6), b=veorq_u64(ch_ld(p+832),b6); l0=ch_fll(l0,a,b); h0=ch_fhh(h0,a,b); }
+        { uint64x2_t a=veorq_u64(ch_ld(p+784),a6), b=veorq_u64(ch_ld(p+848),b6); l1=ch_fll(l1,a,b); h1=ch_fhh(h1,a,b); }
+        { uint64x2_t a=veorq_u64(ch_ld(p+800),a6), b=veorq_u64(ch_ld(p+864),b6); l2=ch_fll(l2,a,b); h2=ch_fhh(h2,a,b); }
+        { uint64x2_t a=veorq_u64(ch_ld(p+816),a6), b=veorq_u64(ch_ld(p+880),b6); l3=ch_fll(l3,a,b); h3=ch_fhh(h3,a,b); }
+        { uint64x2_t a=veorq_u64(ch_ld(p+896),a7), b=veorq_u64(ch_ld(p+960),b7); l0=ch_fll(l0,a,b); h0=ch_fhh(h0,a,b); }
+        { uint64x2_t a=veorq_u64(ch_ld(p+912),a7), b=veorq_u64(ch_ld(p+976),b7); l1=ch_fll(l1,a,b); h1=ch_fhh(h1,a,b); }
+        { uint64x2_t a=veorq_u64(ch_ld(p+928),a7), b=veorq_u64(ch_ld(p+992),b7); l2=ch_fll(l2,a,b); h2=ch_fhh(h2,a,b); }
+        { uint64x2_t a=veorq_u64(ch_ld(p+944),a7), b=veorq_u64(ch_ld(p+1008),b7); l3=ch_fll(l3,a,b); h3=ch_fhh(h3,a,b); }
+        s0=veorq_u64(l0,h0); s1=veorq_u64(l1,h1); s2=veorq_u64(l2,h2); s3=veorq_u64(l3,h3);
+#else
         uint64x2_t u0=vdupq_n_u64(0),u1=u0,u2=u0,u3=u0;
         { uint64x2_t a=veorq_u64(ch_ld(p+0),a0), b=veorq_u64(ch_ld(p+64),b0); u0=ch_xor3(u0,ch_ll(a,b),ch_hh(a,b)); }
         { uint64x2_t a=veorq_u64(ch_ld(p+16),a0), b=veorq_u64(ch_ld(p+80),b0); u1=ch_xor3(u1,ch_ll(a,b),ch_hh(a,b)); }
@@ -598,6 +650,7 @@ CH_INLINE uint64_t ch_bulk_neon_run(const chainhash_key *k,const uint8_t *p,size
         s1=ch_xor3(u1,ch_ll(s1,y),ch_hh(s1,y));
         s2=ch_xor3(u2,ch_ll(s2,y),ch_hh(s2,y));
         s3=ch_xor3(u3,ch_ll(s3,y),ch_hh(s3,y));
+#endif
         p+=1024;
     } while(--regions);
     if(st) { vst1q_u64(&st[0].lo,s0); vst1q_u64(&st[1].lo,s1); vst1q_u64(&st[2].lo,s2); vst1q_u64(&st[3].lo,s3); return 0; }
