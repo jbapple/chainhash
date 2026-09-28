@@ -100,6 +100,48 @@ static inline int ch128_detect(void) {
 #elif !defined(CHAINHASH128_PORTABLE) && defined(__aarch64__) && !defined(__AARCH64EB__) && (defined(__ARM_FEATURE_AES) || defined(__ARM_FEATURE_CRYPTO))
 #define CH128_ARM 1
 #include <arm_neon.h>
+/* EOR3 is FEAT_SHA3 (optional from ARMv8.2): it is emitted only when the target
+ * guarantees it (CH128_SHA3 1) or, otherwise, when the CPU reports it at run time
+ * (CH128_SHA3 2: Linux HWCAP, Apple sysctl; other systems count it as absent).
+ * Define CHAINHASH128_NO_SHA3 to force the EOR-only kernels. Same digest either way. */
+#if defined(CHAINHASH128_NO_SHA3)
+#define CH128_SHA3 0
+#elif defined(__ARM_FEATURE_SHA3)
+#define CH128_SHA3 1
+#else
+#define CH128_SHA3 2
+#if defined(__linux__)
+#include <sys/auxv.h>
+#elif defined(__APPLE__)
+/* Declared here: <sys/sysctl.h> does not compile under strict _POSIX_C_SOURCE. */
+#ifdef __cplusplus
+extern "C"
+#endif
+int sysctlbyname(const char *,void *,size_t *,void *,size_t);
+#endif
+static inline int ch128_sha3_detect(void) {
+#if defined(__linux__)
+#ifdef HWCAP_SHA3
+    return (getauxval(AT_HWCAP)&HWCAP_SHA3)!=0;
+#else
+    return (getauxval(AT_HWCAP)&(1ul<<17))!=0;
+#endif
+#elif defined(__APPLE__)
+    int v=0; size_t n=sizeof(v);
+    if(sysctlbyname("hw.optional.arm.FEAT_SHA3",&v,&n,NULL,0)!=0) { v=0; n=sizeof(v); if(sysctlbyname("hw.optional.armv8_2_sha3",&v,&n,NULL,0)!=0) v=0; }
+    return v!=0;
+#else
+    return 0;
+#endif
+}
+#endif
+static inline int ch128_has_sha3(void) {
+#if CH128_SHA3 == 2
+    static int cache=-1; int v=__atomic_load_n(&cache,__ATOMIC_RELAXED); if(v<0) { v=ch128_sha3_detect(); __atomic_store_n(&cache,v,__ATOMIC_RELAXED); } return v;
+#else
+    return CH128_SHA3;
+#endif
+}
 #endif
 static inline int chainhash128_backend(void) {
 #ifdef CH128_X86
@@ -1130,7 +1172,7 @@ static void ch128_n_region(const chainhash128_key *k,const uint8_t *p,ch128_raw 
  * pairs and advances the two half pointers by one 256-byte chunk. FOLD
  * advances the four raw states by y^4. Expanded instructions are audited
  * in audit/; these macros introduce no calls or runtime choices. */
-#if defined(__ARM_FEATURE_SHA3)
+#if CH128_SHA3 == 1
 #define CH128_NX3(D,A,B,C) "eor3 v" #D ".16b,v" #A ".16b,v" #B ".16b,v" #C ".16b\n\t"
 #else
 #define CH128_NX3(D,A,B,C) "eor v" #D ".16b,v" #A ".16b,v" #B ".16b\n\t" \
@@ -1529,22 +1571,26 @@ static __attribute__((noinline)) ch128_word ch128_n_bulk0(const chainhash128_key
  * v0..v7: raw states; v8..v19: three-component block accumulators;
  * v20..v27: four word pairs; v28/v29: keys; v30/v31: scratch.
  * No hot-loop stack spills or vector-to-integer transfers are possible. */
-/* Round-2: two-step batched schoolbook comb (NEW, M2 SHA3).
+/* Round-2: two-step batched schoolbook comb.
  * Processes two adjacent 256-byte chunks per invocation and folds each
- * pair's two low/high partial products into the lane accumulator with a
- * single eor3 instead of two eor, cutting the accumulate-XOR op count in
- * half. XOR is associative/commutative so the accumulated value, the
- * reduction and the digest are bit-identical to CH128_NSTEP1. Uses only
- * x9 (data) + x11 (key) with ldr-immediate offsets; keys are per-chunk and
- * shared across the four lanes. Registers: v0-v7 states, v8-v19 lane
+ * pair's two low/high partial products into the lane accumulator with
+ * E3(D,A,B): D^=A^B. CH128_NE3S is a single eor3 (FEAT_SHA3); CH128_NE3B
+ * is two eor that combine the dead scratch A^=B first, so the accumulator
+ * still takes one XOR per fold. XOR is associative/commutative so the
+ * accumulated value, the reduction and the digest are bit-identical to
+ * CH128_NSTEP1. Uses only x9 (data) + x11 (key) with ldr-immediate offsets;
+ * keys are per-chunk and shared across the four lanes. Registers: v0-v7 states, v8-v19 lane
  * accumulators, v20-v23 words, v24/v25 chunk-A ll/hh, v26-v29 the two key
  * pairs, v30/v31 scratch. */
+#define CH128_NE3S(D,A,B) "eor3 v" #D ".16b,v" #D ".16b,v" #A ".16b,v" #B ".16b\n\t"
+#define CH128_NE3B(D,A,B) "eor v" #A ".16b,v" #A ".16b,v" #B ".16b\n\t" \
+                          "eor v" #D ".16b,v" #D ".16b,v" #A ".16b\n\t"
 #define CH128_NKEYS2 \
       "ldr q28,[x11,#0]\n\t" \
       "ldr q29,[x11,#16]\n\t" \
       "ldr q26,[x11,#32]\n\t" \
       "ldr q27,[x11,#48]\n\t"
-#define CH128_NPAIR2(OaA,ObA,OaB,ObB,LL,HH,MID) \
+#define CH128_NPAIR2(E3,OaA,ObA,OaB,ObB,LL,HH,MID) \
       "ldr q20,[x9,#" #OaA "]\n\t" \
       "ldr q21,[x9,#" #ObA "]\n\t" \
       "ldr q22,[x9,#" #OaB "]\n\t" \
@@ -1558,91 +1604,108 @@ static __attribute__((noinline)) ch128_word ch128_n_bulk0(const chainhash128_key
       "ext v30.16b,v21.16b,v21.16b,#8\n\t" \
       "pmull v31.1q,v20.1d,v30.1d\n\t" \
       "pmull2 v30.1q,v20.2d,v30.2d\n\t" \
-      "eor3 v" #MID ".16b,v" #MID ".16b,v31.16b,v30.16b\n\t" \
+      E3(MID,31,30) \
       "pmull v31.1q,v22.1d,v23.1d\n\t" \
-      "eor3 v" #LL ".16b,v" #LL ".16b,v24.16b,v31.16b\n\t" \
+      E3(LL,24,31) \
       "pmull2 v31.1q,v22.2d,v23.2d\n\t" \
-      "eor3 v" #HH ".16b,v" #HH ".16b,v25.16b,v31.16b\n\t" \
+      E3(HH,25,31) \
       "ext v30.16b,v23.16b,v23.16b,#8\n\t" \
       "pmull v31.1q,v22.1d,v30.1d\n\t" \
       "pmull2 v30.1q,v22.2d,v30.2d\n\t" \
-      "eor3 v" #MID ".16b,v" #MID ".16b,v31.16b,v30.16b\n\t"
-#define CH128_NPH1X2 \
+      E3(MID,31,30)
+#define CH128_NPH1X2(E3) \
       CH128_NKEYS2 \
-      CH128_NPAIR2(0,128,256,384,8,9,10) \
-      CH128_NPAIR2(16,144,272,400,11,12,13) \
-      CH128_NPAIR2(32,160,288,416,14,15,16) \
-      CH128_NPAIR2(48,176,304,432,17,18,19) \
+      CH128_NPAIR2(E3,0,128,256,384,8,9,10) \
+      CH128_NPAIR2(E3,16,144,272,400,11,12,13) \
+      CH128_NPAIR2(E3,32,160,288,416,14,15,16) \
+      CH128_NPAIR2(E3,48,176,304,432,17,18,19) \
       "add x9,x9,#512\n\t" \
       "add x11,x11,#64\n\t"
-static __attribute__((noinline)) ch128_word ch128_n_bulk1(const chainhash128_key *k,const uint8_t *p,size_t regions,size_t len,ch128_raw *st) {
-    ch128_raw state[4],acc={{0,0},{0,0}};uint8_t *out=(uint8_t *)state;unsigned j;
-    if(st) memcpy(state,st,sizeof(state)); else { memset(state,0,sizeof(state)); state[3].lo.lo=len; }
-    __asm__ volatile(
-      "add x9,%[out],#64\n\t"
-      "ld1 {v0.2d,v1.2d,v2.2d,v3.2d},[%[out]]\n\t"
-      "ld1 {v4.2d,v5.2d,v6.2d,v7.2d},[x9]\n\t"
-      "1:\n\t"
-      "movi v8.2d,#0\n\t"
-      "movi v9.2d,#0\n\t"
-      "movi v10.2d,#0\n\t"
-      "movi v11.2d,#0\n\t"
-      "movi v12.2d,#0\n\t"
-      "movi v13.2d,#0\n\t"
-      "movi v14.2d,#0\n\t"
-      "movi v15.2d,#0\n\t"
-      "movi v16.2d,#0\n\t"
-      "movi v17.2d,#0\n\t"
-      "movi v18.2d,#0\n\t"
-      "movi v19.2d,#0\n\t"
-      "add x9,%[p],#0\n\t"
-      "mov x11,%[key]\n\t"
-      CH128_NPH1X2
-      CH128_NPH1X2
-      CH128_NPH1X2
-      CH128_NPH1X2
 #if CHAINHASH128_BLOCK_BYTES == 512
-      CH128_NPH1X2
-      CH128_NPH1X2
-      CH128_NPH1X2
-      CH128_NPH1X2
+#define CH128_NPH1X2HI(E3) CH128_NPH1X2(E3) CH128_NPH1X2(E3) CH128_NPH1X2(E3) CH128_NPH1X2(E3)
+#else
+#define CH128_NPH1X2HI(E3)
 #endif
-      CH128_NFOLD1
-      "movi v8.2d,#0\n\t"
-      "movi v9.2d,#0\n\t"
-      "movi v10.2d,#0\n\t"
-      "movi v11.2d,#0\n\t"
-      "movi v12.2d,#0\n\t"
-      "movi v13.2d,#0\n\t"
-      "movi v14.2d,#0\n\t"
-      "movi v15.2d,#0\n\t"
-      "movi v16.2d,#0\n\t"
-      "movi v17.2d,#0\n\t"
-      "movi v18.2d,#0\n\t"
-      "movi v19.2d,#0\n\t"
-      "add x9,%[p],#64\n\t"
-      "mov x11,%[key]\n\t"
-      CH128_NPH1X2
-      CH128_NPH1X2
-      CH128_NPH1X2
-      CH128_NPH1X2
-#if CHAINHASH128_BLOCK_BYTES == 512
-      CH128_NPH1X2
-      CH128_NPH1X2
-      CH128_NPH1X2
-      CH128_NPH1X2
+/* One template, two instantiations: ch128_n_bulk1s (eor3) and ch128_n_bulk1b
+ * (eor only); PRE lets the SHA3 kernel assemble on a non-SHA3 target. */
+#define CH128_NBULK1(NAME,E3,PRE) \
+static __attribute__((noinline)) ch128_word NAME(const chainhash128_key *k,const uint8_t *p,size_t regions,size_t len,ch128_raw *st) { \
+    ch128_raw state[4],acc={{0,0},{0,0}};uint8_t *out=(uint8_t *)state;unsigned j; \
+    if(st) memcpy(state,st,sizeof(state)); else { memset(state,0,sizeof(state)); state[3].lo.lo=len; } \
+    __asm__ volatile( \
+      PRE \
+      "add x9,%[out],#64\n\t" \
+      "ld1 {v0.2d,v1.2d,v2.2d,v3.2d},[%[out]]\n\t" \
+      "ld1 {v4.2d,v5.2d,v6.2d,v7.2d},[x9]\n\t" \
+      "1:\n\t" \
+      "movi v8.2d,#0\n\t" \
+      "movi v9.2d,#0\n\t" \
+      "movi v10.2d,#0\n\t" \
+      "movi v11.2d,#0\n\t" \
+      "movi v12.2d,#0\n\t" \
+      "movi v13.2d,#0\n\t" \
+      "movi v14.2d,#0\n\t" \
+      "movi v15.2d,#0\n\t" \
+      "movi v16.2d,#0\n\t" \
+      "movi v17.2d,#0\n\t" \
+      "movi v18.2d,#0\n\t" \
+      "movi v19.2d,#0\n\t" \
+      "add x9,%[p],#0\n\t" \
+      "mov x11,%[key]\n\t" \
+      CH128_NPH1X2(E3) \
+      CH128_NPH1X2(E3) \
+      CH128_NPH1X2(E3) \
+      CH128_NPH1X2(E3) \
+      CH128_NPH1X2HI(E3) \
+      CH128_NFOLD1 \
+      "movi v8.2d,#0\n\t" \
+      "movi v9.2d,#0\n\t" \
+      "movi v10.2d,#0\n\t" \
+      "movi v11.2d,#0\n\t" \
+      "movi v12.2d,#0\n\t" \
+      "movi v13.2d,#0\n\t" \
+      "movi v14.2d,#0\n\t" \
+      "movi v15.2d,#0\n\t" \
+      "movi v16.2d,#0\n\t" \
+      "movi v17.2d,#0\n\t" \
+      "movi v18.2d,#0\n\t" \
+      "movi v19.2d,#0\n\t" \
+      "add x9,%[p],#64\n\t" \
+      "mov x11,%[key]\n\t" \
+      CH128_NPH1X2(E3) \
+      CH128_NPH1X2(E3) \
+      CH128_NPH1X2(E3) \
+      CH128_NPH1X2(E3) \
+      CH128_NPH1X2HI(E3) \
+      CH128_NFOLD1 \
+      "add %[p],%[p],%[rb]\n\t" \
+      "subs %[count],%[count],#1\n\t" \
+      "b.ne 1b\n\t" \
+      "st1 {v0.2d,v1.2d,v2.2d,v3.2d},[%[out]],#64\n\t" \
+      "st1 {v4.2d,v5.2d,v6.2d,v7.2d},[%[out]]\n\t" \
+      : [p] "+&r"(p),[count] "+&r"(regions),[out] "+&r"(out) \
+      : [key] "r"(k->ph),[yp] "r"(k->yp+4),[yh] "r"(k->yh+4),[rb] "I"(CH128_REGION) \
+      : "x9","x10","x11","cc","memory","v0","v1","v2","v3","v4","v5","v6","v7","v8","v9","v10","v11","v12","v13","v14","v15","v16","v17","v18","v19","v20","v21","v22","v23","v24","v25","v26","v27","v28","v29","v30","v31"); \
+    if(st) { memcpy(st,state,sizeof(state)); return ch128_make(0,0); } \
+    for(j=0;j<4;j++) {acc=ch128_rxor(acc,ch128_prod(state[j].lo,k->yp[3-j],4,1));acc=ch128_rxor(acc,ch128_prod(state[j].hi,k->yh[3-j],4,1));}return ch128_reduce(acc); \
+}
+
+#if CH128_SHA3 == 2
+CH128_NBULK1(ch128_n_bulk1s,CH128_NE3S,".arch_extension sha3\n\t")
+#elif CH128_SHA3 == 1
+CH128_NBULK1(ch128_n_bulk1s,CH128_NE3S,"")
 #endif
-      CH128_NFOLD1
-      "add %[p],%[p],%[rb]\n\t"
-      "subs %[count],%[count],#1\n\t"
-      "b.ne 1b\n\t"
-      "st1 {v0.2d,v1.2d,v2.2d,v3.2d},[%[out]],#64\n\t"
-      "st1 {v4.2d,v5.2d,v6.2d,v7.2d},[%[out]]\n\t"
-      : [p] "+&r"(p),[count] "+&r"(regions),[out] "+&r"(out)
-      : [key] "r"(k->ph),[yp] "r"(k->yp+4),[yh] "r"(k->yh+4),[rb] "I"(CH128_REGION)
-      : "x9","x10","x11","cc","memory","v0","v1","v2","v3","v4","v5","v6","v7","v8","v9","v10","v11","v12","v13","v14","v15","v16","v17","v18","v19","v20","v21","v22","v23","v24","v25","v26","v27","v28","v29","v30","v31");
-    if(st) { memcpy(st,state,sizeof(state)); return ch128_make(0,0); }
-    for(j=0;j<4;j++) {acc=ch128_rxor(acc,ch128_prod(state[j].lo,k->yp[3-j],4,1));acc=ch128_rxor(acc,ch128_prod(state[j].hi,k->yh[3-j],4,1));}return ch128_reduce(acc);
+#if CH128_SHA3 != 1
+CH128_NBULK1(ch128_n_bulk1b,CH128_NE3B,"")
+#endif
+static inline ch128_word ch128_n_bulk1(const chainhash128_key *k,const uint8_t *p,size_t regions,size_t len,ch128_raw *st) {
+#if CH128_SHA3 == 2
+    return ch128_has_sha3()?ch128_n_bulk1s(k,p,regions,len,st):ch128_n_bulk1b(k,p,regions,len,st);
+#elif CH128_SHA3 == 1
+    return ch128_n_bulk1s(k,p,regions,len,st);
+#else
+    return ch128_n_bulk1b(k,p,regions,len,st);
+#endif
 }
 #undef CH128_NX3
 #undef CH128_NPH0
@@ -1654,6 +1717,10 @@ static __attribute__((noinline)) ch128_word ch128_n_bulk1(const chainhash128_key
 #undef CH128_NKEYS2
 #undef CH128_NPAIR2
 #undef CH128_NPH1X2
+#undef CH128_NPH1X2HI
+#undef CH128_NE3S
+#undef CH128_NE3B
+#undef CH128_NBULK1
 
 #endif
 
