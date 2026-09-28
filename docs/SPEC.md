@@ -255,7 +255,7 @@ Backend IDs are `CH_PORTABLE=0`, `CH_XMM=1`, `CH_YMM=2`,
 `chainhash_has_backend(id)` check. GCC/Clang x86 target attributes allow
 baseline compilation with no global ISA flags; CPUID and XGETBV check
 instruction and OS state support. XMM needs AVX and PCLMUL, YMM additionally
-AVX2 and VPCLMULQDQ, ZMM additionally AVX512F and enabled ZMM state.
+AVX2 and VPCLMULQDQ, ZMM additionally AVX512F, AVX512BW and enabled ZMM state.
 The detection cache uses relaxed atomics. AArch64 NEON needs crypto
 instructions enabled at build time; use `-march=native+crypto` on Apple or
 `-march=armv8-a+crypto` on other AArch64 hosts. `CHAINHASH_NEON_FUSE` (default

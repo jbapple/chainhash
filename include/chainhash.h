@@ -73,13 +73,13 @@ static inline chainhash_key chainhash_key_from_seed(uint64_t seed) {
 #include <cpuid.h>
 #define CH_T128 __attribute__((target("avx,pclmul")))
 #define CH_T256 __attribute__((target("avx2,pclmul,vpclmulqdq")))
-#define CH_T512 __attribute__((target("avx2,pclmul,avx512f,vpclmulqdq")))
+#define CH_T512 __attribute__((target("avx2,pclmul,avx512f,avx512bw,vpclmulqdq")))
 static inline int ch_detect(void) {
     unsigned a,b,c,d,l,h;
     if(!__get_cpuid(1,&a,&b,&c,&d) || (c&((1u<<1)|(1u<<27)|(1u<<28)))!=((1u<<1)|(1u<<27)|(1u<<28))) return 0;
     __asm__ volatile("xgetbv":"=a"(l),"=d"(h):"c"(0)); if((l&6)!=6) return 0;
     if(!__get_cpuid_count(7,0,&a,&b,&c,&d) || !(b&(1u<<5)) || !(c&(1u<<10))) return 1;
-    return (l&0xe6)==0xe6 && (b&(1u<<16)) ? 3:2;
+    return (l&0xe6)==0xe6 && (b&(1u<<16)) && (b&(1u<<30)) ? 3:2;   /* ZMM: AVX512F and AVX512BW */
 }
 CH_T128 static inline ch_raw ch_hwprod(uint64_t a,uint64_t b) {
     ch_raw r; __m128i v=_mm_clmulepi64_si128(_mm_set_epi64x(0,(long long)a),_mm_set_epi64x(0,(long long)b),0); _mm_storeu_si128((__m128i_u *)&r,v); return r;
@@ -483,24 +483,27 @@ CH_T512 static inline uint64_t ch_fold512(__m512i s,const chainhash_key *k) {
     __m128i q=_mm_xor_si128(_mm256_castsi256_si128(h),_mm256_extracti128_si256(h,1));
     ch_raw r; _mm_storeu_si128((__m128i_u *)&r,q); return ch_reduce(r);
 }
-/* Tail loads never cross the input object. A padded 128-byte chunk handles
- * the last partial word; both keyed multiplicands are masked by first-word
- * presence. Horner weights act on all four lanes in two vector products. */
+/* Tail loads never cross the input object: the last partial chunk is read with
+ * masked byte loads (bytes past the input are zero and are not accessed); both
+ * keyed multiplicands are masked by first-word presence. Horner weights act on all
+ * four lanes in two vector products; they are gathered from the key in registers.
+ * No vector load reads back narrower stores (store-forwarding stalls). */
 CH_T512 static uint64_t ch_tail512(const chainhash_key *k,const uint8_t *p,size_t n,uint64_t leading) {
-    __m512i acc=_mm512_setzero_si512(); unsigned c=0,j,lanes=ch_lanes(n); size_t rem=n;
-    uint64_t weights[8];
+    /* Lane j of `lanes` takes weight (yp[e],yh[e]), e=lanes-1-j, and e=0 past the last lane. */
+    static const uint64_t widx[4][8]={{0,8,0,8,0,8,0,8},{1,9,0,8,0,8,0,8},{2,10,1,9,0,8,0,8},{3,11,2,10,1,9,0,8}};
+    __m512i acc=_mm512_setzero_si512(); unsigned c=0,lanes=ch_lanes(n); size_t rem=n;
     while(rem) {
         __m512i a,b; size_t take=rem<128?rem:128;
         if(take==128) { a=_mm512_loadu_si512(p); b=_mm512_loadu_si512(p+64); }
-        else { uint8_t tmp[128]={0}; memcpy(tmp,p,take); a=_mm512_loadu_si512(tmp); b=_mm512_loadu_si512(tmp+64); }
+        else { a=_mm512_maskz_loadu_epi8(take>=64?~(__mmask64)0:((__mmask64)1<<take)-1,p);
+               b=_mm512_maskz_loadu_epi8(take<=64?(__mmask64)0:((__mmask64)1<<(take-64))-1,p+64); }
         a=_mm512_xor_si512(a,_mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i_u *)(k->ph+4*c))));
         b=_mm512_xor_si512(b,_mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i_u *)(k->ph+4*c+2))));
         if(take<64) { __mmask8 mask=(__mmask8)((1u<<((take+7)/8))-1); a=_mm512_maskz_mov_epi64(mask,a); b=_mm512_maskz_mov_epi64(mask,b); }
         acc=_mm512_ternarylogic_epi64(acc,_mm512_clmulepi64_epi128(a,b,0),_mm512_clmulepi64_epi128(a,b,0x11),0x96);
         rem-=take; p+=take; ++c;
     }
-    for(j=0;j<4;j++) { unsigned e=j<lanes?lanes-1-j:0; weights[2*j]=k->yp[e]; weights[2*j+1]=k->yh[e]; }
-    __m512i pw=_mm512_loadu_si512(weights);
+    __m512i pw=_mm512_permutex2var_epi64(_mm512_loadu_si512(k->yp),_mm512_loadu_si512(widx[lanes-1]),_mm512_loadu_si512(k->yh));
     acc=_mm512_xor_si512(_mm512_clmulepi64_epi128(acc,pw,0),_mm512_clmulepi64_epi128(acc,pw,0x11));
     __m256i h=_mm256_xor_si256(_mm512_castsi512_si256(acc),_mm512_extracti64x4_epi64(acc,1));
     __m128i v=_mm_xor_si128(_mm256_castsi256_si128(h),_mm256_extracti128_si256(h,1));
