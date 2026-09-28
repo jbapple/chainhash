@@ -19,7 +19,7 @@ SANITIZE = -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer
 RANDOM_CASES ?= 20000
 RANDOM_CASES_128 ?= 20000
 
-TESTS = compile frozen schedule vectors guard key_alignment property
+TESTS = compile frozen schedule vectors guard key_alignment property schedule_knobs
 TESTS_128 = compile frozen schedule arithmetic vectors edges guard short property
 BINS = $(addprefix build/64-,$(TESTS))
 BINS_128 = $(addprefix build/128-,$(TESTS_128))
@@ -52,6 +52,8 @@ test: $(BINS) $(addsuffix -portable,$(BINS)) build/64-cpp
 	./build/64-key_alignment-portable
 	./build/64-property $(RANDOM_CASES) 123456789
 	./build/64-property-portable $(RANDOM_CASES) 123456789
+	./build/64-schedule_knobs $(RANDOM_CASES)
+	./build/64-schedule_knobs-portable 2000
 sanitize: | build
 	$(CC) $(CPPFLAGS) -std=c99 $(SANITIZE) $(ARCH_FLAGS) test/guard.c -o build/64-guard-sanitize
 	./build/64-guard-sanitize
@@ -59,6 +61,8 @@ sanitize: | build
 	./build/64-key_alignment-sanitize
 	$(CC) $(CPPFLAGS) -std=c99 $(SANITIZE) $(ARCH_FLAGS) -pthread test/property.c -o build/64-property-sanitize
 	./build/64-property-sanitize 0 123456789
+	$(CC) $(CPPFLAGS) -std=c99 $(SANITIZE) $(ARCH_FLAGS) test/schedule_knobs.c -o build/64-schedule_knobs-sanitize
+	./build/64-schedule_knobs-sanitize 1500
 
 # ChainHash-128: each test is built natively and with CHAINHASH128_PORTABLE.
 build/128-%: test/128/%.c include/chainhash128.h test/128/oracle.h | build

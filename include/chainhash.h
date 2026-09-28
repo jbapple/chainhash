@@ -77,7 +77,7 @@ static inline chainhash_key chainhash_key_from_seed(uint64_t seed) {
 static inline int ch_detect(void) {
     unsigned a,b,c,d,l,h;
     if(!__get_cpuid(1,&a,&b,&c,&d) || (c&((1u<<1)|(1u<<27)|(1u<<28)))!=((1u<<1)|(1u<<27)|(1u<<28))) return 0;
-    __asm__("xgetbv":"=a"(l),"=d"(h):"c"(0)); if((l&6)!=6) return 0;
+    __asm__ volatile("xgetbv":"=a"(l),"=d"(h):"c"(0)); if((l&6)!=6) return 0;
     if(!__get_cpuid_count(7,0,&a,&b,&c,&d) || !(b&(1u<<5)) || !(c&(1u<<10))) return 1;
     return (l&0xe6)==0xe6 && (b&(1u<<16)) ? 3:2;
 }
@@ -118,6 +118,28 @@ static inline ch_raw ch_prod(uint64_t a,uint64_t b,int backend) {
 }
 static inline uint64_t ch_fmul(uint64_t a,uint64_t b,int backend) { return ch_reduce(ch_prod(a,b,backend)); }
 static inline uint64_t ch_pow(uint64_t a,uint64_t n,int backend) { uint64_t r=1; while(n) { if(n&1) r=ch_fmul(r,a,backend); n>>=1; if(n) a=ch_fmul(a,a,backend); } return r; }
+/* Software prefetch in the bulk kernels: hint CH_PF_T0/T1/NTA (AArch64 PLDL1KEEP/
+ * PLDL2KEEP/PLDL1STRM) every step bytes of the region dist bytes ahead, formed only
+ * while that region lies inside the input. A hint has no architectural effect, so
+ * no setting changes a digest. hint and step are compile-time constants of each
+ * kernel instance; CH_PF_OFF is the shipped kernel. */
+#ifndef CHAINHASH_PF_HINTS
+#define CHAINHASH_PF_HINTS
+enum { CH_PF_OFF=0, CH_PF_T0=1, CH_PF_T1=2, CH_PF_NTA=3 };
+#endif
+#if defined(CH_X86) || defined(CH_ARM)
+#define CH_INLINE static inline __attribute__((always_inline))
+#define CH_PREFETCH(p,regions,bytes,hint,step,dist) do { if((hint) && (dist)<=((regions)-1)*(size_t)(bytes)) { unsigned o_; \
+    for(o_=0;o_<(bytes);o_+=(step)) { const char *q_=(const char *)(p)+(dist)+o_; \
+        if((hint)==CH_PF_T0) __builtin_prefetch(q_,0,3); else if((hint)==CH_PF_T1) __builtin_prefetch(q_,0,2); else __builtin_prefetch(q_,0,0); } } } while(0)
+/* The prefetching instances of a kernel NAME##_run(args...,hint,step,dist): hint and step
+ * fixed, dist run time. */
+#define CH_PF_SWITCH(NAME,...) switch(hint*2+(step==128)) { \
+    case 2: return NAME##_run(__VA_ARGS__,CH_PF_T0,64,dist);  case 3: return NAME##_run(__VA_ARGS__,CH_PF_T0,128,dist); \
+    case 4: return NAME##_run(__VA_ARGS__,CH_PF_T1,64,dist);  case 5: return NAME##_run(__VA_ARGS__,CH_PF_T1,128,dist); \
+    case 6: return NAME##_run(__VA_ARGS__,CH_PF_NTA,64,dist); case 7: return NAME##_run(__VA_ARGS__,CH_PF_NTA,128,dist); \
+    default: return NAME##_run(__VA_ARGS__,CH_PF_OFF,64,0); }
+#endif
 #ifdef CH_X86
 /* Low lane as an integer: _mm_cvtsi128_si64 is x86-64 only in GCC. */
 CH_T128 static inline uint64_t ch_lane0(__m128i v) {
@@ -250,13 +272,15 @@ CH_T128 static inline __m128i ch_xor128(__m128i a,__m128i b,__m128i c) {
 CH_T256 static inline __m256i ch_xor256(__m256i a,__m256i b,__m256i c) {
     __m256i r=_mm256_xor_si256(a,_mm256_xor_si256(b,c)); __asm__("" : "+x"(r)); return r;
 }
-CH_T128 static uint64_t ch_bulk128(const chainhash_key *k,const uint8_t *p,size_t regions,size_t len) {
+CH_T128 CH_INLINE uint64_t ch_bulk128_run(const chainhash_key *k,const uint8_t *p,size_t regions,size_t len,ch_raw *st,const int hint,const unsigned step,size_t dist) {
     __m128i s0=_mm_setzero_si128();
     __m128i s1=_mm_setzero_si128();
     __m128i s2=_mm_setzero_si128();
     __m128i s3=_mm_set_epi64x(0,(long long)len);
     const __m128i y=_mm_set_epi64x((long long)k->yh[4],(long long)k->yp[4]);
+    if(st) { s0=_mm_loadu_si128((const __m128i_u *)st); s1=_mm_loadu_si128((const __m128i_u *)(st+1)); s2=_mm_loadu_si128((const __m128i_u *)(st+2)); s3=_mm_loadu_si128((const __m128i_u *)(st+3)); }
     do {
+        CH_PREFETCH(p,regions,1024,hint,step,dist);
         __m128i u0=_mm_setzero_si128();
         __m128i u1=_mm_setzero_si128();
         __m128i u2=_mm_setzero_si128();
@@ -315,6 +339,7 @@ CH_T128 static uint64_t ch_bulk128(const chainhash_key *k,const uint8_t *p,size_
         s3=ch_xor128(u3,_mm_clmulepi64_si128(s3,y,0),_mm_clmulepi64_si128(s3,y,0x11));
         p+=1024;
     } while(--regions);
+    if(st) { _mm_storeu_si128((__m128i_u *)st,s0); _mm_storeu_si128((__m128i_u *)(st+1),s1); _mm_storeu_si128((__m128i_u *)(st+2),s2); _mm_storeu_si128((__m128i_u *)(st+3),s3); return 0; }
     __m128i acc=_mm_setzero_si128(),pw;
     pw=_mm_set_epi64x((long long)k->yh[3],(long long)k->yp[3]);
     acc=_mm_xor_si128(acc,_mm_xor_si128(_mm_clmulepi64_si128(s0,pw,0),_mm_clmulepi64_si128(s0,pw,0x11)));
@@ -327,11 +352,15 @@ CH_T128 static uint64_t ch_bulk128(const chainhash_key *k,const uint8_t *p,size_
     __m128i a=acc;
     return ch_lane0(ch_vreduce(a));
 }
-CH_T256 static uint64_t ch_bulk256(const chainhash_key *k,const uint8_t *p,size_t regions,size_t len) {
+CH_T128 static uint64_t ch_bulk128(const chainhash_key *k,const uint8_t *p,size_t regions,size_t len,ch_raw *st) { return ch_bulk128_run(k,p,regions,len,st,CH_PF_OFF,64,0); }
+CH_T128 static uint64_t ch_bulk128_pf(const chainhash_key *k,const uint8_t *p,size_t regions,size_t len,ch_raw *st,int hint,unsigned step,size_t dist) { CH_PF_SWITCH(ch_bulk128,k,p,regions,len,st) }
+CH_T256 CH_INLINE uint64_t ch_bulk256_run(const chainhash_key *k,const uint8_t *p,size_t regions,size_t len,ch_raw *st,const int hint,const unsigned step,size_t dist) {
     __m256i s0=_mm256_setzero_si256();
     __m256i s1=_mm256_set_epi64x(0,(long long)len,0,0);
     const __m256i y=_mm256_set_epi64x((long long)k->yh[4],(long long)k->yp[4],(long long)k->yh[4],(long long)k->yp[4]);
+    if(st) { s0=_mm256_loadu_si256((const __m256i_u *)st); s1=_mm256_loadu_si256((const __m256i_u *)(st+2)); }
     do {
+        CH_PREFETCH(p,regions,1024,hint,step,dist);
         __m256i u0=_mm256_setzero_si256();
         __m256i u1=_mm256_setzero_si256();
         { const __m256i ka=ch_key256(k->ph+0), kb=ch_key256(k->ph+2);
@@ -370,6 +399,7 @@ CH_T256 static uint64_t ch_bulk256(const chainhash_key *k,const uint8_t *p,size_
         s1=ch_xor256(u1,_mm256_clmulepi64_epi128(s1,y,0),_mm256_clmulepi64_epi128(s1,y,0x11));
         p+=1024;
     } while(--regions);
+    if(st) { _mm256_storeu_si256((__m256i_u *)st,s0); _mm256_storeu_si256((__m256i_u *)(st+2),s1); return 0; }
     __m256i acc=_mm256_setzero_si256(),pw;
     pw=_mm256_set_epi64x((long long)k->yh[2],(long long)k->yp[2],(long long)k->yh[3],(long long)k->yp[3]);
     acc=_mm256_xor_si256(acc,_mm256_xor_si256(_mm256_clmulepi64_epi128(s0,pw,0),_mm256_clmulepi64_epi128(s0,pw,0x11)));
@@ -378,6 +408,8 @@ CH_T256 static uint64_t ch_bulk256(const chainhash_key *k,const uint8_t *p,size_
     __m128i a=_mm_xor_si128(_mm256_castsi256_si128(acc),_mm256_extracti128_si256(acc,1));
     return ch_lane0(ch_vreduce(a));
 }
+CH_T256 static uint64_t ch_bulk256(const chainhash_key *k,const uint8_t *p,size_t regions,size_t len,ch_raw *st) { return ch_bulk256_run(k,p,regions,len,st,CH_PF_OFF,64,0); }
+CH_T256 static uint64_t ch_bulk256_pf(const chainhash_key *k,const uint8_t *p,size_t regions,size_t len,ch_raw *st,int hint,unsigned step,size_t dist) { CH_PF_SWITCH(ch_bulk256,k,p,regions,len,st) }
 /* The only cross-lane fold is AFTER all complete regions. */
 CH_T512 static inline uint64_t ch_fold512(__m512i s,const chainhash_key *k) {
     __m512i powers=_mm512_set_epi64((long long)k->yh[0],(long long)k->yp[0],(long long)k->yh[1],(long long)k->yp[1],(long long)k->yh[2],(long long)k->yp[2],(long long)k->yh[3],(long long)k->yp[3]);
@@ -410,7 +442,7 @@ CH_T512 static uint64_t ch_tail512(const chainhash_key *k,const uint8_t *p,size_
     v=_mm_xor_si128(v,_mm_clmulepi64_si128(_mm_set_epi64x(0,(long long)leading),_mm_set_epi64x(0,(long long)k->yp[lanes]),0));
     return ch_lane0(ch_vreduce(v));
 }
-CH_T512 static uint64_t ch_bulk512(const chainhash_key *k,const uint8_t *p,size_t regions,size_t len) {
+CH_T512 CH_INLINE uint64_t ch_bulk512_run(const chainhash_key *k,const uint8_t *p,size_t regions,size_t len,ch_raw *st,const int hint,const unsigned step,size_t dist) {
     __m512i s=_mm512_set_epi64(0,(long long)len,0,0,0,0,0,0);
     const __m512i y=_mm512_broadcast_i32x4(_mm_set_epi64x((long long)k->yh[4],(long long)k->yp[4]));
     const __m512i a0=_mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i_u *)(k->ph+0))), b0=_mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i_u *)(k->ph+2)));
@@ -421,7 +453,9 @@ CH_T512 static uint64_t ch_bulk512(const chainhash_key *k,const uint8_t *p,size_
     const __m512i a5=_mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i_u *)(k->ph+20))), b5=_mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i_u *)(k->ph+22)));
     const __m512i a6=_mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i_u *)(k->ph+24))), b6=_mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i_u *)(k->ph+26)));
     const __m512i a7=_mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i_u *)(k->ph+28))), b7=_mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i_u *)(k->ph+30)));
+    if(st) s=_mm512_loadu_si512(st);
     do {
+        CH_PREFETCH(p,regions,1024,hint,step,dist);
         __m512i u0,u1,u2,u3;
         { __m512i a=_mm512_xor_si512(_mm512_loadu_si512(p+0),a0), b=_mm512_xor_si512(_mm512_loadu_si512(p+64),b0);
           u0=_mm512_xor_si512(_mm512_clmulepi64_epi128(a,b,0),_mm512_clmulepi64_epi128(a,b,0x11)); }
@@ -442,8 +476,11 @@ CH_T512 static uint64_t ch_bulk512(const chainhash_key *k,const uint8_t *p,size_
         s=_mm512_ternarylogic_epi64(_mm512_clmulepi64_epi128(s,y,0),_mm512_clmulepi64_epi128(s,y,0x11),_mm512_xor_si512(_mm512_ternarylogic_epi64(u0,u1,u2,0x96),u3),0x96);
         p+=1024;
     } while(--regions);
+    if(st) { _mm512_storeu_si512(st,s); return 0; }
     return ch_fold512(s,k);
 }
+CH_T512 static uint64_t ch_bulk512(const chainhash_key *k,const uint8_t *p,size_t regions,size_t len,ch_raw *st) { return ch_bulk512_run(k,p,regions,len,st,CH_PF_OFF,64,0); }
+CH_T512 static uint64_t ch_bulk512_pf(const chainhash_key *k,const uint8_t *p,size_t regions,size_t len,ch_raw *st,int hint,unsigned step,size_t dist) { CH_PF_SWITCH(ch_bulk512,k,p,regions,len,st) }
 #endif
 
 #ifdef CH_ARM
@@ -459,7 +496,7 @@ static inline void ch_region_neon(const chainhash_key *k,const uint8_t *p,ch_raw
     { uint64x2_t a=veorq_u64(ch_ld(p+896+16*j),vld1q_u64(k->ph+28)), b=veorq_u64(ch_ld(p+960+16*j),vld1q_u64(k->ph+30)); s=ch_xor3(s,ch_ll(a,b),ch_hh(a,b)); }
     vst1q_u64(&out[j].lo,s); }
 }
-static uint64_t ch_bulk_neon(const chainhash_key *k,const uint8_t *p,size_t regions,size_t len) {
+CH_INLINE uint64_t ch_bulk_neon_run(const chainhash_key *k,const uint8_t *p,size_t regions,size_t len,ch_raw *st,const int hint,const unsigned step,size_t dist) {
     uint64x2_t s0=vdupq_n_u64(0),s1=s0,s2=s0,s3=vcombine_u64(vcreate_u64(len),vcreate_u64(0));
     const uint64x2_t y=vcombine_u64(vcreate_u64(k->yp[4]),vcreate_u64(k->yh[4]));
     const uint64x2_t a0=vld1q_u64(k->ph+0),b0=vld1q_u64(k->ph+2);
@@ -470,7 +507,9 @@ static uint64_t ch_bulk_neon(const chainhash_key *k,const uint8_t *p,size_t regi
     const uint64x2_t a5=vld1q_u64(k->ph+20),b5=vld1q_u64(k->ph+22);
     const uint64x2_t a6=vld1q_u64(k->ph+24),b6=vld1q_u64(k->ph+26);
     const uint64x2_t a7=vld1q_u64(k->ph+28),b7=vld1q_u64(k->ph+30);
+    if(st) { s0=vld1q_u64(&st[0].lo); s1=vld1q_u64(&st[1].lo); s2=vld1q_u64(&st[2].lo); s3=vld1q_u64(&st[3].lo); }
     do {
+        CH_PREFETCH(p,regions,1024,hint,step,dist);
         uint64x2_t u0=vdupq_n_u64(0),u1=u0,u2=u0,u3=u0;
         { uint64x2_t a=veorq_u64(ch_ld(p+0),a0), b=veorq_u64(ch_ld(p+64),b0); u0=ch_xor3(u0,ch_ll(a,b),ch_hh(a,b)); }
         { uint64x2_t a=veorq_u64(ch_ld(p+16),a0), b=veorq_u64(ch_ld(p+80),b0); u1=ch_xor3(u1,ch_ll(a,b),ch_hh(a,b)); }
@@ -510,6 +549,7 @@ static uint64_t ch_bulk_neon(const chainhash_key *k,const uint8_t *p,size_t regi
         s3=ch_xor3(u3,ch_ll(s3,y),ch_hh(s3,y));
         p+=1024;
     } while(--regions);
+    if(st) { vst1q_u64(&st[0].lo,s0); vst1q_u64(&st[1].lo,s1); vst1q_u64(&st[2].lo,s2); vst1q_u64(&st[3].lo,s3); return 0; }
     uint64x2_t acc=vdupq_n_u64(0),pw;
     pw=vcombine_u64(vcreate_u64(k->yp[3]),vcreate_u64(k->yh[3])); acc=ch_xor3(acc,ch_ll(s0,pw),ch_hh(s0,pw));
     pw=vcombine_u64(vcreate_u64(k->yp[2]),vcreate_u64(k->yh[2])); acc=ch_xor3(acc,ch_ll(s1,pw),ch_hh(s1,pw));
@@ -517,6 +557,8 @@ static uint64_t ch_bulk_neon(const chainhash_key *k,const uint8_t *p,size_t regi
     pw=vcombine_u64(vcreate_u64(k->yp[0]),vcreate_u64(k->yh[0])); acc=ch_xor3(acc,ch_ll(s3,pw),ch_hh(s3,pw));
     ch_raw r; vst1q_u64(&r.lo,acc); return ch_reduce(r);
 }
+static uint64_t ch_bulk_neon(const chainhash_key *k,const uint8_t *p,size_t regions,size_t len,ch_raw *st) { return ch_bulk_neon_run(k,p,regions,len,st,CH_PF_OFF,64,0); }
+static uint64_t ch_bulk_neon_pf(const chainhash_key *k,const uint8_t *p,size_t regions,size_t len,ch_raw *st,int hint,unsigned step,size_t dist) { CH_PF_SWITCH(ch_bulk_neon,k,p,regions,len,st) }
 #endif
 static inline void ch_region(const chainhash_key *k,const uint8_t *p,size_t n,ch_raw out[4],int b) {
     if(n==1024) {
@@ -554,9 +596,28 @@ static inline void ch_absorb(chainhash_stream *s,const uint8_t *p,size_t n) {
         ++s->blocks;
     }
 }
+/* Whole regions of a stride-4 stream run through the bulk kernel, whose lane j
+ * holds the blocks congruent to j mod 4 like state j: the kernel starts from the
+ * stream's raw states and writes them back (eager states are reduced again). */
+static inline int ch_stream_bulk(chainhash_stream *s,const uint8_t *p,size_t regions) {
+#if defined(CH_X86) || defined(CH_ARM)
+    const chainhash_key *k=s->key; int b=s->backend; unsigned j;
+    if(s->stride!=4 || s->blocks%4) return 0;
+#ifdef CH_X86
+    if(b==3) ch_bulk512(k,p,regions,0,s->state); else if(b==2) ch_bulk256(k,p,regions,0,s->state); else if(b==1) ch_bulk128(k,p,regions,0,s->state); else return 0;
+#else
+    if(b==4) ch_bulk_neon(k,p,regions,0,s->state); else return 0;
+#endif
+    if(!s->lazy) for(j=0;j<4;j++) { s->state[j].lo=ch_reduce(s->state[j]); s->state[j].hi=0; }
+    s->blocks+=4*(uint64_t)regions; return 1;
+#else
+    (void)s; (void)p; (void)regions; return 0;
+#endif
+}
 static inline void chainhash_update(chainhash_stream *s,const void *data,size_t n) {
     const uint8_t *p=(const uint8_t *)data; assert(n<=UINT64_MAX-s->len); s->len+=n;
     if(s->used) { size_t take=1024-s->used; if(take>n) take=n; if(take) { memcpy(s->buffer+s->used,p,take); p+=take; } s->used+=take; n-=take; if(s->used==1024) { ch_absorb(s,s->buffer,1024); s->used=0; } }
+    if(n>=1024 && ch_stream_bulk(s,p,n/1024)) { p+=n/1024*1024; n%=1024; }
     while(n>=1024) { ch_absorb(s,p,1024); p+=1024; n-=1024; }
     if(n) { memcpy(s->buffer,p,n); s->used=n; }
 }
@@ -592,17 +653,17 @@ static inline uint64_t chainhash_portable(const chainhash_key *k,const void *dat
     } while(1);
     return ch_finish(k,v,0);
 }
-static inline uint64_t chainhash_with_backend(const chainhash_key *k,const void *data,size_t len,int backend) {
+static inline uint64_t ch_hash(const chainhash_key *k,const void *data,size_t len,int backend,int hint,unsigned step,size_t dist) {
     const uint8_t *p=(const uint8_t *)data; size_t full=len/1024,n=len%1024; uint64_t v=len;
-    assert(chainhash_has_backend(backend));
+    assert(chainhash_has_backend(backend)); (void)hint; (void)step; (void)dist;
     if(full) {
 #ifdef CH_X86
-        if(backend==3) v=ch_bulk512(k,p,full,len);
-        else if(backend==2) v=ch_bulk256(k,p,full,len);
-        else if(backend==1) v=ch_bulk128(k,p,full,len);
+        if(backend==3) v=hint?ch_bulk512_pf(k,p,full,len,0,hint,step,dist):ch_bulk512(k,p,full,len,0);
+        else if(backend==2) v=hint?ch_bulk256_pf(k,p,full,len,0,hint,step,dist):ch_bulk256(k,p,full,len,0);
+        else if(backend==1) v=hint?ch_bulk128_pf(k,p,full,len,0,hint,step,dist):ch_bulk128(k,p,full,len,0);
         else return chainhash_evaluate(k,data,len,4,1,backend);
 #elif defined(CH_ARM)
-        if(backend==4) v=ch_bulk_neon(k,p,full,len);
+        if(backend==4) v=hint?ch_bulk_neon_pf(k,p,full,len,0,hint,step,dist):ch_bulk_neon(k,p,full,len,0);
         else return chainhash_evaluate(k,data,len,4,1,backend);
 #else
         return chainhash_evaluate(k,data,len,4,1,backend);
@@ -617,7 +678,15 @@ static inline uint64_t chainhash_with_backend(const chainhash_key *k,const void 
     if(n || !full) { ch_raw c[4]; unsigned j; ch_region_scalar(k,p,n,c,backend); for(j=0;j<ch_lanes(n);j++) v=ch_fmul(v,k->yp[1],backend)^ch_reduce(c[j]); }
     return ch_finish(k,v,backend);
 }
+static inline uint64_t chainhash_with_backend(const chainhash_key *k,const void *data,size_t len,int backend) { return ch_hash(k,data,len,backend,CH_PF_OFF,64,0); }
 static inline uint64_t chainhash(const chainhash_key *k,const void *data,size_t len) { return chainhash_with_backend(k,data,len,chainhash_backend()); }
+/* chainhash_with_backend with software prefetch (CH_PF_*, every step = 64 or 128
+ * bytes, dist bytes ahead); an unavailable backend falls back to the detected one.
+ * The digest is the same for every argument; chainhash_calibrate.h chooses them. */
+static inline uint64_t chainhash_with_prefetch(const chainhash_key *k,const void *data,size_t len,int backend,int hint,unsigned step,size_t dist) {
+    if(!chainhash_has_backend(backend)) backend=chainhash_backend();
+    return ch_hash(k,data,len,backend,hint>=CH_PF_T0 && hint<=CH_PF_NTA ? hint : CH_PF_OFF,step,dist);
+}
 #ifdef CH_X86
 static inline uint64_t chainhash_xmm(const chainhash_key *k,const void *p,size_t n) { return chainhash_with_backend(k,p,n,CH_XMM); }
 static inline uint64_t chainhash_ymm(const chainhash_key *k,const void *p,size_t n) { return chainhash_with_backend(k,p,n,CH_YMM); }
