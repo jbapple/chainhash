@@ -1998,14 +1998,14 @@ T static inline V P##_tw(const uint8_t *q,unsigned j,size_t rem,const ch128_word
     for(t=0;t<4;t++) w[t]=t<N && 16*(j+t)<rem ? ch128_128_xor(ch128_128_word(q,off+16*(j+t),rem),kk) : ch128_128_zero(); \
     return P##_mk(w[0],w[1],w[2],w[3]); \
 } \
-T static inline V P##_yw(const ch128_word *y,unsigned count,unsigned j) { \
+T static inline V P##_yw(const ch128_word *y,size_t count,unsigned j) { \
     __m128i w[4]; unsigned t; \
     for(t=0;t<4;t++) w[t]=t<N && j+t<count ? ch128_128_load(y+count-1-j-t) : ch128_128_zero(); \
     return P##_mk(w[0],w[1],w[2],w[3]); \
 } \
 T static inline ch128_word P##_tail(const chainhash128_key *k,const uint8_t *p,size_t n,ch128_word v,int school) { \
     ch128_word lo[N],hi[N]; \
-    size_t chunks=n/256,rem=n%256; unsigned j,c,count=ch128_lanes(n); \
+    size_t chunks=n/256,rem=n%256,count=ch128_lanes(n); unsigned j,c; \
     const uint8_t *q=p+256*chunks; P##_acc sum=P##_azero(); P##_raw r; \
     ch128_128_raw total=ch128_128_prod(_mm_set_epi64x((long long)v.hi,(long long)v.lo),ch128_128_load(k->yp+count),0); \
     for(j=0;j<8;j+=N) { \
@@ -2034,7 +2034,7 @@ CH128_NBEGIN
  * 128 input bytes); skip absent first words so no key-only pairs are added.
  * The cached powers combine the independent lanes without a serial Horner chain. */
 static inline ch128_word ch128_n_tail(const chainhash128_key *k,const uint8_t *p,size_t n,ch128_word v,int school) {
-    size_t chunks=n/256,rem=n%256; unsigned j,c,count=ch128_lanes(n); const uint8_t *q=p+256*chunks;
+    size_t chunks=n/256,rem=n%256,count=ch128_lanes(n); unsigned j,c; const uint8_t *q=p+256*chunks;
     ch128_n_acc sum=ch128_n_accum(ch128_n_azero(),vcombine_u64(vcreate_u64(v.lo),vcreate_u64(v.hi)),ch128_n_load(k->yp+count),0);
     ch128_n_raw last;
     last.lo=last.hi=ch128_n_zero();
