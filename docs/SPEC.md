@@ -95,7 +95,7 @@ expands eight successive SplitMix64 outputs into 64 key bytes. It has only
 64 bits of seed entropy and does not supply the random bytes the collision
 bound assumes.
 
-The resident `chainhash_key` is 56 words / 448 bytes, with ordinary
+The resident `chainhash_key` is 64 words / 512 bytes, with ordinary
 `uint64_t` alignment. Its fields are:
 
 ```text
@@ -103,7 +103,11 @@ ph[4C..4C+3] = [kappa[4C], kappa[4C+2], kappa[4C+1], kappa[4C+3]]
 yp[i] = y^i       for i=0..8, yp[0]=1
 yh[i] = 27*y^i    for i=0..8, yh[0]=27
 c[0..4], tau
+sp[2e], sp[2e+1] = kappa[1]*y^e, kappa[3]*y^e   for e=0..3
 ```
+
+The last eight words weight the inputs of at most 64 bytes, in which every
+word's partner is absent, so each word meets one product.
 
 The first-half load at byte offset `128C+16j` receives key words
 `[kappa[4C],kappa[4C+2]]`; its partner load at `128C+64+16j` receives

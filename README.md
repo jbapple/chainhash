@@ -83,7 +83,7 @@ per-ISA entry points `chainhash_xmm/ymm/zmm/neon` exist only for the
 64-bit function.
 
 - **Keys.** `chainhash_key_from_bytes` takes the 64 random bytes; the
-  key object (448 bytes; 1024 for ChainHash-128) caches the expanded block
+  key object (512 bytes; 1024 for ChainHash-128) caches the expanded block
   keys and can be shared read-only between threads. `chainhash_key_from_seed`
   expands a 64-bit seed for benchmarks and tests; it does not supply the
   randomness the bound assumes. `chainhash_key_from_words` takes the 39

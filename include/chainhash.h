@@ -24,7 +24,8 @@
 #include <assert.h>
 #define CHAINHASH_KEY_BYTES 64
 /* ph[4C..4C+3] = kappa[4C], kappa[4C+2], kappa[4C+1], kappa[4C+3]. */
-typedef struct { uint64_t ph[32], yp[9], yh[9], c[5], tau; } chainhash_key;
+/* sp[2e], sp[2e+1] = kappa[1]*y^e, kappa[3]*y^e (e = 0..3): the short path's lane weights. */
+typedef struct { uint64_t ph[32], yp[9], yh[9], c[5], tau, sp[8]; } chainhash_key;
 typedef struct { uint64_t lo, hi; } ch_raw;
 enum { CH_PORTABLE=0, CH_XMM=1, CH_YMM=2, CH_ZMM=3, CH_NEON=4 };
 static inline uint64_t ch_word(const uint8_t *p,size_t n,size_t off) {
@@ -36,6 +37,7 @@ static inline uint64_t ch_word(const uint8_t *p,size_t n,size_t off) {
     for(i=0;i<8 && i<n-off;i++) a|=(uint64_t)p[off+i]<<(8*i);
     return a;
 }
+static inline unsigned ch_lanes(size_t n) { return n>48 ? 4 : n ? (unsigned)((n-1)/16+1) : 1; }
 static inline ch_raw ch_clmul(uint64_t a,uint64_t b) {
     ch_raw r={0,0}; unsigned i;
     for(i=0;i<64;i++) { uint64_t m=0-((b>>i)&1); r.lo^=(a<<i)&m; if(i) r.hi^=(a>>(64-i))&m; }
@@ -53,6 +55,7 @@ static inline uint64_t ch_fmul(uint64_t a,uint64_t b,int backend);
 static inline void ch_schedule(chainhash_key *k,uint64_t y) {
     unsigned i; int b=chainhash_backend(); k->yp[0]=1; k->yh[0]=27;
     for(i=1;i<=8;i++) { k->yp[i]=ch_fmul(k->yp[i-1],y,b); k->yh[i]=ch_fmul(27,k->yp[i],b); }
+    for(i=0;i<4;i++) { k->sp[2*i]=ch_fmul(k->ph[2],k->yp[i],b); k->sp[2*i+1]=ch_fmul(k->ph[3],k->yp[i],b); }
 }
 static inline chainhash_key chainhash_key_from_words(const uint64_t w[39]) {
     chainhash_key k; unsigned c;
@@ -240,58 +243,117 @@ CH_T128 static inline __m128i ch_vreduce(__m128i a) {
     __m128i t=_mm_clmulepi64_si128(a,r,0x11),u=_mm_clmulepi64_si128(t,r,0x11);
     return _mm_xor_si128(a,_mm_xor_si128(t,u));
 }
-/* Reduction of a 128-bit product by shifts, for latency-bound code: with h the high
- * word and q = h>>63 ^ h>>61 ^ h>>60 (the bits h*27 carries past bit 63), lane 0 becomes
- * lo ^ h*27 ^ q*27 as in ch_reduce. About 8 cycles on every x86 core and no PCLMULQDQ,
- * against two dependent products in ch_vreduce. Lane 1 of the result is not meaningful. */
-CH_T128 static inline __m128i ch_vfold(__m128i a) {
-    __m128i h=_mm_unpackhi_epi64(a,a),q,r;
-    q=_mm_xor_si128(_mm_srli_epi64(h,63),_mm_xor_si128(_mm_srli_epi64(h,61),_mm_srli_epi64(h,60)));
-    r=_mm_xor_si128(_mm_xor_si128(a,h),_mm_xor_si128(_mm_slli_epi64(h,1),_mm_xor_si128(_mm_slli_epi64(h,3),_mm_slli_epi64(h,4))));
-    q=_mm_xor_si128(_mm_xor_si128(q,_mm_slli_epi64(q,1)),_mm_xor_si128(_mm_slli_epi64(q,3),_mm_slli_epi64(q,4)));
-    return _mm_xor_si128(r,q);
+/* Latency form of the reduction and the finalizer. Values travel in lane 1 of a vector (lane 0
+ * is scratch): every product selects its lanes by immediate, and lane 1 of an unreduced
+ * product a = lo + X^64 hi is reduced in four dependent steps. With h = hi, h*27 = h ^ h<<1 ^
+ * h<<3 ^ h<<4 plus the carry-out q = h>>63 ^ h>>61 ^ h>>60 times 27, and q*27 is a function of
+ * the top nibble h>>60 alone: a 16-entry PSHUFB table. ch_fold1(a,c): lane 1 = (a mod p) ^ c.hi. */
+static const uint8_t ch_q27[16]={0,27,45,54,90,65,119,108,175,180,130,153,245,238,216,195};
+CH_T128 static inline __m128i ch_fold1(__m128i a,__m128i c) {
+    __m128i t=_mm_shuffle_epi8(_mm_loadu_si128((const __m128i_u *)ch_q27),_mm_srli_epi64(a,60));
+    __m128i u=_mm_xor_si128(_mm_xor_si128(a,c),_mm_unpacklo_epi64(a,a));
+    __m128i v=_mm_xor_si128(_mm_slli_epi64(a,1),_mm_slli_epi64(a,3));
+    return _mm_xor_si128(_mm_xor_si128(u,v),_mm_xor_si128(_mm_slli_epi64(a,4),t));
 }
-/* The finalizer on lane 0 of v; the high lanes of v and of every intermediate are
- * ignored (every product selects a lane explicitly). The last product absorbs the
- * reduction of its right factor: with z = x^c2, R the raw middle product and
- * w = z*X^64 mod p (available early), z*(R^c3) = z*(R.lo^c3) ^ w*R.hi mod p. */
-CH_T128 static inline uint64_t ch_finish128(const chainhash_key *k,__m128i v) {
-    __m128i x=_mm_add_epi64(v,_mm_loadl_epi64((const __m128i *)&k->tau)),q=ch_vfold(_mm_clmulepi64_si128(x,x,0));
-    __m128i a=_mm_xor_si128(q,_mm_loadl_epi64((const __m128i *)&k->c[0])),b=_mm_xor_si128(_mm_xor_si128(x,q),_mm_loadl_epi64((const __m128i *)&k->c[1]));
-    __m128i z=_mm_xor_si128(x,_mm_loadl_epi64((const __m128i *)&k->c[2])),w=ch_vfold(_mm_slli_si128(z,8));
-    __m128i R=_mm_clmulepi64_si128(a,b,0);
-    __m128i r=_mm_xor_si128(_mm_clmulepi64_si128(z,_mm_xor_si128(R,_mm_loadl_epi64((const __m128i *)&k->c[3])),0x00),_mm_clmulepi64_si128(w,R,0x10));
-    return ch_lane0(ch_vfold(r))^k->c[4];
+CH_T128 static inline __m128i ch_dup(const uint64_t *p) { return _mm_castpd_si128(_mm_loaddup_pd((const double *)p)); }
+/* The finalizer on lane 1 of v (reduced): x = v + tau, q = x^2, R = (q^c0)(x^q^c1) raw,
+ * out = z*(R^c3) ^ c4 with z = x^c2. The reductions of q^c0 and x^q^c1 share one fold of x^2
+ * with the constants injected; z*(R^c3) = z*R.lo ^ w*R.hi ^ z*c3 with w = z*X^64 mod p, and
+ * z*c3 ^ c4 are formed while R is computed, so the chain is three products and two folds. */
+CH_T128 static inline uint64_t ch_fin1(const chainhash_key *k,__m128i v) {
+    const __m128i zero=_mm_setzero_si128();
+    __m128i x=_mm_add_epi64(v,ch_dup(&k->tau)),Q=_mm_clmulepi64_si128(x,x,0x11);
+    __m128i z=_mm_unpackhi_epi64(zero,_mm_xor_si128(x,ch_dup(k->c+2))),w=ch_fold1(z,zero);
+    __m128i F=ch_fold1(_mm_clmulepi64_si128(z,ch_dup(k->c+3),0x01),ch_dup(k->c+4));
+    __m128i R=_mm_clmulepi64_si128(ch_fold1(Q,ch_dup(k->c)),ch_fold1(Q,_mm_xor_si128(x,ch_dup(k->c+1))),0x11);
+    __m128i r=_mm_xor_si128(_mm_clmulepi64_si128(z,R,0x01),_mm_clmulepi64_si128(w,R,0x11));
+    return (uint64_t)_mm_extract_epi64(ch_fold1(r,F),1);
 }
-CH_T128 static uint64_t ch_fastfinish(const chainhash_key *k,uint64_t v) { return ch_finish128(k,_mm_set_epi64x(0,(long long)v)); }
+/* The finalizer on lane 0 of v (reduced). */
+CH_T128 static inline uint64_t ch_finish128(const chainhash_key *k,__m128i v) { return ch_fin1(k,_mm_unpacklo_epi64(v,v)); }
+CH_T128 static uint64_t ch_fastfinish(const chainhash_key *k,uint64_t v) { return ch_fin1(k,_mm_set_epi64x((long long)v,0)); }
 #elif defined(CH_ARM)
 CH_NBEGIN
 static inline uint64x2_t ch_vreduce(uint64x2_t a) { const uint64x2_t r=vdupq_n_u64(27); uint64x2_t t=ch_hh(a,r); return ch_xor3(a,t,ch_hh(t,r)); }
 static inline uint64x2_t ch_v64(uint64_t v) { return vcombine_u64(vcreate_u64(v),vcreate_u64(0)); }
 static inline uint64x2_t ch_ld(const uint8_t *p) { return vreinterpretq_u64_u8(vld1q_u8(p)); }
+/* ch_nred(a,c): lane 0 = (a mod p) ^ c.lo, the constant injected beside the two reduction
+ * products (a^c is formed while they run). */
+static inline uint64x2_t ch_nred(uint64x2_t a,uint64x2_t c) {
+    const uint64x2_t r=vdupq_n_u64(27); uint64x2_t t=ch_hh(a,r); return ch_xor3(veorq_u64(a,c),t,ch_hh(t,r));
+}
+/* The finalizer on lane 0 of v (reduced), as ch_fin1 on x86: q^c0 and x^q^c1 share the
+ * reduction products of x^2 with the constants injected, and the last product absorbs the
+ * reduction of R: z*(R^c3) = z*R.lo ^ w*R.hi ^ z*c3 with w = z*X^64 mod p and z*c3 ^ c4
+ * formed while R is computed. Three products and two reductions after the twist. */
 static inline uint64_t ch_finish_neon_vec(const chainhash_key *k,uint64x2_t v) {
-    uint64x2_t x=vaddq_u64(v,ch_v64(k->tau)),q=ch_vreduce(ch_ll(x,x));
-    uint64x2_t a=veorq_u64(q,ch_v64(k->c[0])),b=ch_xor3(x,q,ch_v64(k->c[1]));
-    uint64x2_t r=ch_vreduce(ch_ll(a,b));
-    r=ch_vreduce(ch_ll(veorq_u64(x,ch_v64(k->c[2])),veorq_u64(r,ch_v64(k->c[3]))));
-    return vgetq_lane_u64(r,0)^k->c[4];
+    const uint64x2_t r=vdupq_n_u64(27);
+    uint64x2_t x=vaddq_u64(v,vdupq_n_u64(k->tau)),Q=ch_ll(x,x),z=veorq_u64(x,vdupq_n_u64(k->c[2]));
+    uint64x2_t t=ch_hh(Q,r),u=ch_hh(t,r),a=ch_xor3(veorq_u64(Q,vdupq_n_u64(k->c[0])),t,u),b=ch_xor3(veorq_u64(Q,veorq_u64(x,vdupq_n_u64(k->c[1]))),t,u);
+    uint64x2_t zr=ch_ll(z,r),w=vdupq_laneq_u64(veorq_u64(zr,ch_hh(zr,r)),0);
+    uint64x2_t F=ch_nred(ch_ll(z,vdupq_n_u64(k->c[3])),vdupq_n_u64(k->c[4]));
+    uint64x2_t R=ch_ll(a,b);
+    return vgetq_lane_u64(ch_nred(veorq_u64(ch_ll(z,R),ch_hh(w,R)),F),0);
 }
 static inline uint64_t ch_fastfinish(const chainhash_key *k,uint64_t v) {
     return ch_finish_neon_vec(k,ch_v64(v));
 }
-/* Short and final partial regions retain raw products and the Horner fold
- * in SIMD registers. Only the final digest leaves lane 0. */
+/* Up to 64 bytes (every partner absent): one product level against the key-side lane
+ * weights sp, the raw leading term leading*y^L added, one reduction; registers only. */
+static inline uint64x2_t ch_nprod(uint64x2_t a,const uint64_t *P,int hi) {
+    uint64x2_t K=vld1q_u64(P),r=ch_ll(a,K); return hi ? veorq_u64(r,ch_hh(a,K)) : r;
+}
+static inline uint64_t ch_short_neon(const chainhash_key *k,const uint8_t *p,size_t n,uint64_t leading) {
+    static const uint8_t idx[32]={0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,
+        0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80};
+    const uint64x2_t ka=vld1q_u64(k->ph);
+    unsigned lanes=ch_lanes(n);
+    uint64x2_t acc=ch_ll(ch_v64(leading),ch_v64(k->yp[lanes]));
+    if(n<=16) {
+        uint64_t lo,hi;
+        if(n>8) {
+            memcpy(&lo,p,8); memcpy(&hi,p+n-8,8); hi>>=8*(16-n);
+            acc=veorq_u64(acc,ch_nprod(veorq_u64(vcombine_u64(vcreate_u64(lo),vcreate_u64(hi)),ka),k->sp,1));
+        } else if(n) {
+            if(n>=4) { uint32_t a,b; memcpy(&a,p,4); memcpy(&b,p+n-4,4); lo=a|(uint64_t)b<<(8*(n-4)); }
+            else lo=(uint64_t)p[0]|(uint64_t)p[n>>1]<<(8*(n>>1))|(uint64_t)p[n-1]<<(8*(n-1));
+            acc=veorq_u64(acc,ch_nprod(veorq_u64(ch_v64(lo),ka),k->sp,0));
+        }
+    } else {
+        size_t r=n-16*(size_t)(lanes-1);
+        uint64x2_t last=vreinterpretq_u64_u8(vqtbl1q_u8(vld1q_u8(p+n-16),vld1q_u8(idx+16-r)));
+        last=ch_nprod(veorq_u64(last,ka),k->sp,r>8);
+        switch(lanes) {
+        case 2: acc=ch_xor3(acc,ch_nprod(veorq_u64(ch_ld(p),ka),k->sp+2,1),last); break;
+        case 3: acc=ch_xor3(acc,veorq_u64(ch_nprod(veorq_u64(ch_ld(p),ka),k->sp+4,1),ch_nprod(veorq_u64(ch_ld(p+16),ka),k->sp+2,1)),last); break;
+        default: acc=ch_xor3(veorq_u64(acc,ch_nprod(veorq_u64(ch_ld(p),ka),k->sp+6,1)),veorq_u64(ch_nprod(veorq_u64(ch_ld(p+16),ka),k->sp+4,1),ch_nprod(veorq_u64(ch_ld(p+32),ka),k->sp+2,1)),last); break;
+        }
+    }
+    return ch_finish_neon_vec(k,ch_nred(acc,vdupq_n_u64(0)));
+}
+/* The 16 bytes at q+o with the bytes at or past q+rem zero, read in place: a partial word
+ * as the 16 bytes ending at q+rem shifted down by TBL. The caller guarantees that q+rem-16
+ * is inside the input. */
+static inline uint64x2_t ch_nword(const uint8_t *q,size_t o,size_t rem) {
+    static const uint8_t idx[32]={0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,
+        0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80};
+    if(o+16<=rem) return ch_ld(q+o);
+    if(o>=rem) return vdupq_n_u64(0);
+    return vreinterpretq_u64_u8(vqtbl1q_u8(vld1q_u8(q+rem-16),vld1q_u8(idx+16-(rem-o))));
+}
+/* Final partial regions above 64 bytes (the only caller): raw products and the Horner fold
+ * in SIMD registers, the last partial chunk read in place (n > 64, so the 16 bytes before
+ * its end are input). Only the final digest leaves lane 0. */
 static uint64_t ch_tail_neon(const chainhash_key *k,const uint8_t *p,size_t n,uint64_t leading) {
     uint64x2_t u[4]={vdupq_n_u64(0),vdupq_n_u64(0),vdupq_n_u64(0),vdupq_n_u64(0)};
     unsigned c=0,j,lanes=n>48?4:n?(unsigned)((n-1)/16+1):1;
     size_t rem=n;
     while(rem) {
-        uint8_t tmp[128]={0}; const uint8_t *q=p; size_t take=rem<128?rem:128;
-        if(take<128) { memcpy(tmp,p,take); q=tmp; }
+        size_t take=rem<128?rem:128;
         uint64x2_t ka=vld1q_u64(k->ph+4*c),kb=vld1q_u64(k->ph+4*c+2);
         for(j=0;j<4;j++) if(16*j<take) {
-            uint64x2_t a=veorq_u64(ch_ld(q+16*j),ka);
-            uint64x2_t b=veorq_u64(ch_ld(q+64+16*j),kb);
+            uint64x2_t a=veorq_u64(take==128 ? ch_ld(p+16*j) : ch_nword(p,16*j,take),ka);
+            uint64x2_t b=veorq_u64(take==128 ? ch_ld(p+64+16*j) : ch_nword(p,64+16*j,take),kb);
             if(take<=16*j+8) { a=vsetq_lane_u64(0,a,1); b=vsetq_lane_u64(0,b,1); }
             u[j]=ch_xor3(u[j],ch_ll(a,b),ch_hh(a,b));
         }
@@ -303,7 +365,7 @@ static uint64_t ch_tail_neon(const chainhash_key *k,const uint8_t *p,size_t n,ui
         if(!e) acc=veorq_u64(acc,u[j]);
         else { uint64x2_t pw=vcombine_u64(vcreate_u64(k->yp[e]),vcreate_u64(k->yh[e])); acc=ch_xor3(acc,ch_ll(u[j],pw),ch_hh(u[j],pw)); }
     }
-    return ch_finish_neon_vec(k,ch_vreduce(acc));
+    return ch_finish_neon_vec(k,ch_nred(acc,vdupq_n_u64(0)));
 }
 CH_NEND
 #endif
@@ -312,7 +374,6 @@ static inline uint64_t ch_finish(const chainhash_key *k,uint64_t v,int b) {
     if(b) return ch_fastfinish(k,v);
 #endif
     uint64_t q,r; v+=k->tau; q=ch_fmul(v,v,b); r=ch_fmul(q^k->c[0],v^q^k->c[1],b); return ch_fmul(v^k->c[2],r^k->c[3],b)^k->c[4]; }
-static inline unsigned ch_lanes(size_t n) { return n>48 ? 4 : n ? (unsigned)((n-1)/16+1) : 1; }
 /* Partial region: a pair is active iff its FIRST word has a byte. */
 static inline void ch_region_scalar(const chainhash_key *k,const uint8_t *p,size_t n,ch_raw out[4],int b) {
     unsigned c,j,e; memset(out,0,4*sizeof(*out));
@@ -352,19 +413,44 @@ CH_T128 static inline __m128i ch_weigh(const chainhash_key *k,__m128i u,unsigned
     return _mm_xor_si128(_mm_clmulepi64_si128(u,_mm_loadl_epi64((const __m128i *)(k->yp+e)),0x00),
                          _mm_clmulepi64_si128(u,_mm_loadl_epi64((const __m128i *)(k->yh+e)),0x01));
 }
-/* Up to 64 bytes every partner word is absent, so a pair is (word ^ kappa) * kappa'.
- * Registers only: each lane is weighted as it is formed. */
+/* Up to 64 bytes every partner word is absent, so lane j contributes (w ^ kappa0)*kappa1 ^
+ * (w' ^ kappa2)*kappa3 weighted by y^(L-1-j): with the key-side weights sp (kappa1*y^e, kappa3*y^e)
+ * every data word meets one product, all products are independent, and the raw sum is folded
+ * once with the leading term leading*y^L (formed while the data load) injected. Registers only;
+ * each lane count has its own straight-line code. */
+CH_T128 static inline __m128i ch_sprod(__m128i a,const uint64_t *P,int hi) {
+    __m128i K=_mm_loadu_si128((const __m128i_u *)P),r=_mm_clmulepi64_si128(a,K,0x00);
+    return hi ? _mm_xor_si128(r,_mm_clmulepi64_si128(a,K,0x11)) : r;
+}
+CH_T128 static inline __m128i ch_sword(const uint8_t *p,__m128i ka,const uint64_t *P) {
+    return ch_sprod(_mm_xor_si128(_mm_loadu_si128((const __m128i_u *)p),ka),P,1);
+}
 CH_T128 static inline uint64_t ch_short128(const chainhash_key *k,const uint8_t *p,size_t n,uint64_t leading) {
-    unsigned lanes=ch_lanes(n),j;
-    const __m128i ka=_mm_loadu_si128((const __m128i_u *)k->ph),kb=_mm_loadu_si128((const __m128i_u *)(k->ph+2));
-    __m128i acc=_mm_clmulepi64_si128(_mm_set_epi64x(0,(long long)leading),_mm_loadl_epi64((const __m128i *)(k->yp+lanes)),0);
-    for(j=0;j<lanes && 16*j<n;j++) {
-        __m128i a=_mm_xor_si128(ch_ldword(p,n,16*j),ka),u;
-        if(n<=16*j+8) a=_mm_move_epi64(a);
-        u=_mm_xor_si128(_mm_clmulepi64_si128(a,kb,0),_mm_clmulepi64_si128(a,kb,0x11));
-        acc=_mm_xor_si128(acc,j+1<lanes ? ch_weigh(k,u,lanes-1-j) : u);
+    const __m128i ka=_mm_loadu_si128((const __m128i_u *)k->ph);
+    unsigned lanes=ch_lanes(n);
+    __m128i C=ch_fold1(_mm_clmulepi64_si128(_mm_cvtsi64_si128((long long)leading),_mm_loadl_epi64((const __m128i *)(k->yp+lanes)),0),_mm_setzero_si128()),acc;
+    if(n<=16) {
+        uint64_t lo,hi; __m128i K=_mm_loadu_si128((const __m128i_u *)k->sp);
+        if(n>8) {
+            memcpy(&lo,p,8); memcpy(&hi,p+n-8,8); hi>>=8*(16-n);
+            acc=_mm_xor_si128(_mm_clmulepi64_si128(_mm_xor_si128(_mm_cvtsi64_si128((long long)lo),ka),K,0x00),
+                              _mm_clmulepi64_si128(_mm_xor_si128(_mm_cvtsi64_si128((long long)hi),_mm_unpackhi_epi64(ka,ka)),K,0x10));
+        } else {
+            if(n>=4) { uint32_t a,b; memcpy(&a,p,4); memcpy(&b,p+n-4,4); lo=a|(uint64_t)b<<(8*(n-4)); }
+            else if(n) lo=(uint64_t)p[0]|(uint64_t)p[n>>1]<<(8*(n>>1))|(uint64_t)p[n-1]<<(8*(n-1));
+            else return ch_fin1(k,C);
+            acc=_mm_clmulepi64_si128(_mm_xor_si128(_mm_cvtsi64_si128((long long)lo),ka),K,0x00);
+        }
+    } else {
+        size_t r=n-16*(size_t)(lanes-1);   /* bytes in the last lane, 1..16 */
+        __m128i last=ch_sprod(_mm_xor_si128(ch_ldend(p+n,r),ka),k->sp,r>8);
+        switch(lanes) {
+        case 2: acc=_mm_xor_si128(ch_sword(p,ka,k->sp+2),last); break;
+        case 3: acc=_mm_xor_si128(_mm_xor_si128(ch_sword(p,ka,k->sp+4),ch_sword(p+16,ka,k->sp+2)),last); break;
+        default: acc=_mm_xor_si128(_mm_xor_si128(ch_sword(p,ka,k->sp+6),ch_sword(p+16,ka,k->sp+4)),_mm_xor_si128(ch_sword(p+32,ka,k->sp+2),last)); break;
+        }
     }
-    return ch_finish128(k,ch_vfold(acc));
+    return ch_fin1(k,ch_fold1(acc,C));
 }
 CH_T128 __attribute__((noinline)) static uint64_t ch_tail128(const chainhash_key *k,const uint8_t *p,size_t n,uint64_t leading) {
     size_t full=n/128,rem=n%128; unsigned j,c;
@@ -383,7 +469,7 @@ CH_T128 __attribute__((noinline)) static uint64_t ch_tail128(const chainhash_key
     }
     acc=_mm_clmulepi64_si128(_mm_set_epi64x(0,(long long)leading),_mm_loadl_epi64((const __m128i *)(k->yp+4)),0);
     acc=_mm_xor_si128(_mm_xor_si128(acc,ch_weigh(k,u[0],3)),_mm_xor_si128(ch_weigh(k,u[1],2),_mm_xor_si128(ch_weigh(k,u[2],1),u[3])));
-    return ch_finish128(k,ch_vfold(acc));
+    return ch_fin1(k,ch_fold1(acc,_mm_setzero_si128()));
 }
 CH_T128 static inline void ch_region128(const chainhash_key *k,const uint8_t *p,ch_raw out[4]) {
     unsigned j; for(j=0;j<4;j+=1) {
@@ -893,7 +979,7 @@ static CH_NOINLINE uint64_t ch_hash_body(const chainhash_key *k,const void *data
     if(backend==3 && n>(ch_pclmul_fast() ? 768u : 64u)) return ch_finish(k,ch_tail512(k,p,n,v),backend);
     if(backend && (n || !full)) return ch_tail128(k,p,n,v);
 #elif defined(CH_ARM)
-    if(backend==4 && (n || !full)) return ch_tail_neon(k,p,n,v);
+    if(backend==4 && (n || !full)) return n<=64 ? ch_short_neon(k,p,n,v) : ch_tail_neon(k,p,n,v);
 #endif
     if(n || !full) { ch_raw c[4]; unsigned j; ch_region_scalar(k,p,n,c,backend); for(j=0;j<ch_lanes(n);j++) v=ch_fmul(v,k->yp[1],backend)^ch_reduce(c[j]); }
     return ch_finish(k,v,backend);
@@ -902,6 +988,8 @@ static CH_NOINLINE uint64_t ch_hash_body(const chainhash_key *k,const void *data
 static inline uint64_t ch_hash(const chainhash_key *k,const void *data,size_t len,int backend,int hint,unsigned step,size_t dist) {
 #ifdef CH_X86
     if(len<=64 && backend) return ch_short128(k,(const uint8_t *)data,len,len);
+#elif defined(CH_ARM)
+    if(len<=64 && backend) return ch_short_neon(k,(const uint8_t *)data,len,len);
 #endif
     return ch_hash_body(k,data,len,backend,hint,step,dist);
 }
