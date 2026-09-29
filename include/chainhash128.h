@@ -43,7 +43,18 @@ static inline uint64_t ch128_load64(const uint8_t *p) {
 static inline ch128_word ch128_load(const uint8_t *p) { return ch128_make(ch128_load64(p),ch128_load64(p+8)); }
 static inline void chainhash128_store(void *out, ch128_word v) {
     uint8_t *p=(uint8_t *)out; unsigned i;
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    /* Two word stores from registers: a later narrower load of the digest forwards from
+     * them. (Copying the returned struct lets GCC spill it and move it with one 16-byte
+     * load, which the two register stores of the return value cannot forward to.) */
+    uint64_t lo=v.lo,hi=v.hi; (void)i;
+#if defined(__GNUC__) || defined(__clang__)
+    __asm__("" : "+r"(lo), "+r"(hi));
+#endif
+    memcpy(p,&lo,8); memcpy(p+8,&hi,8);
+#else
     for(i=0;i<8;i++) { p[i]=(uint8_t)(v.lo>>(8*i)); p[i+8]=(uint8_t)(v.hi>>(8*i)); }
+#endif
 }
 /* Independent bit-serial oracle, including the UNREDUCED 256-bit product. */
 static inline ch128_raw ch128_clmul_ref(ch128_word a, ch128_word b) {
