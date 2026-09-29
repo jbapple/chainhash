@@ -102,8 +102,10 @@ it is a benchmark adapter and does not supply the random bytes the
 collision bound assumes.
 
 The resident `chainhash128_key` holds `ph[a] = kappa[a]`, `yp[i] = y^i`
-and `yh[i] = 0x87 * y^i` for `i = 0..8`, then `c[0..4]` and `tau`; so
-`yp[0] = 1` and `yh[0] = 0x87`. It occupies `16(W+24) = 896` bytes. The
+and `yh[i] = 0x87 * y^i` for `i = 0..8`, then `c[0..4]`, `tau` and
+`sk[e] = kappa[1] * y^e` for `e = 0..7` (the weights of the inputs of at most
+128 bytes, whose words all meet `kappa[1]`); so `yp[0] = 1` and
+`yh[0] = 0x87`. It occupies `16(W+32) = 1024` bytes. The
 expanded struct is a cache, not a serialized key format. Setup uses
 portable arithmetic. The key must remain unchanged for every evaluation
 and outlive associated streams.

@@ -104,9 +104,10 @@ b*s^4` that appears while only first halves are present has at most two
 roots (one for a single word), which is why the numerator is 2 at one word
 and the score is exactly 63. The key words y and
 `c0..c4, tau` are independent of s; deriving them from s would need a
-different theorem. The resident 448-byte (896-byte) key object caches the
+different theorem. The resident 448-byte (1024-byte) key object caches the
 rearranged block keys, `y^0..y^8` and `27*y^i` (`0x87*y^i`) for the lazy
-updates, and the finalizer words; it is a cache, not a serialization.
+updates, the finalizer words and (ChainHash-128) the short-input weights
+`kappa[1]*y^e`; it is a cache, not a serialization.
 
 ## Twist and finalizer
 
