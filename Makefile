@@ -24,8 +24,8 @@ TESTS_128 = compile frozen schedule arithmetic vectors edges guard short propert
 BINS = $(addprefix build/64-,$(TESTS))
 BINS_128 = $(addprefix build/128-,$(TESTS_128))
 
-.PHONY: all test test-128 sanitize sanitize-128 vectors speed calibrate clean
-all: build/64-compile build/64-cpp build/128-compile build/128-cpp build/speed
+.PHONY: all test test-128 test-128v2 test-256 test-512 test-all cxx certs sanitize sanitize-128 vectors speed calibrate clean
+all: build/64-compile build/64-cpp build/128-compile build/128-cpp build/speed build/family-compile build/family-cpp
 build:
 	mkdir -p build
 
@@ -104,11 +104,121 @@ sanitize-128: | build
 	$(CC) $(CPPFLAGS) -std=c99 -Wno-overlength-strings $(SANITIZE) $(ARCH_FLAGS) test/128/schedule_knobs.c -o build/128-schedule_knobs-sanitize
 	./build/128-schedule_knobs-sanitize 1500
 
+# Version 2 family: ChainHash-128 v2, ChainHash-256, ChainHash-512 (docs/FAMILY.md).
+# Each is built natively, with no ISA flags (run-time dispatch only) and portable-only.
+# The 256- and 512-bit headers use GNU C (statement expressions, __int128): no -Wpedantic.
+CFLAGS_V2 = $(filter-out -Wpedantic,$(CFLAGS))
+RANDOM_CASES_V2 ?= 20000
+ifeq ($(ARCH),x86_64)
+X86_TESTS_128V2 = build/128v2-test-karatsuba build/128v2-test-schoolbook build/128v2-test-noavx2 build/128v2-test-prebc build/128v2-test-noprebc
+X86_TESTS_256 = build/256-test-zen0 build/256-test-zen1
+# the 256-bit reference's 64x64 carry-less product by PCLMULQDQ (same arithmetic; speed only)
+REF256 = -msse4.1 -DCH256_HW_CLMUL
+else
+REF256 = -DCH256_HW_CLMUL
+endif
+H128V2 = include/chainhash128v2.h include/chainhash128.h
+H256 = include/chainhash256.h
+H512 = include/chainhash512.h include/chainhash512_body.inc
+build/family-compile: test/family/compile.c include/chainhash.h $(H128V2) $(H256) $(H512) | build
+	$(CC) $(CPPFLAGS) $(CFLAGS_V2) -Wno-overlength-strings $(ARCH_FLAGS) $< -o $@
+build/family-compile-portable: test/family/compile.c include/chainhash.h $(H128V2) $(H256) $(H512) | build
+	$(CC) $(CPPFLAGS) $(CFLAGS_V2) -DCHAINHASH_PORTABLE -DCHAINHASH128_PORTABLE -DCHAINHASH256_PORTABLE -DCHAINHASH512_PORTABLE $< -o $@
+build/family-cpp: test/family/compile.c include/chainhash.h $(H128V2) $(H256) $(H512) | build
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(ARCH_FLAGS) -x c++ $< -o $@
+# inputs flush against unmapped pages on both sides (the short-input paths use masked/overlapping loads)
+build/family-page: test/family/page.c $(H128V2) $(H256) $(H512) | build
+	$(CC) $(CPPFLAGS) $(CFLAGS_V2) $(ARCH_FLAGS) $< -o $@
+build/128v2-test: test/128v2/test.c $(H128V2) | build
+	$(CC) $(CPPFLAGS) $(CFLAGS_128) $(ARCH_FLAGS) $< -o $@
+build/128v2-test-noarch: test/128v2/test.c $(H128V2) | build
+	$(CC) $(CPPFLAGS) $(CFLAGS_128) $< -o $@
+build/128v2-test-portable: test/128v2/test.c $(H128V2) | build
+	$(CC) $(CPPFLAGS) $(CFLAGS_128) -DCHAINHASH128_PORTABLE $< -o $@
+build/128v2-test-karatsuba: test/128v2/test.c $(H128V2) | build
+	$(CC) $(CPPFLAGS) $(CFLAGS_128) $(ARCH_FLAGS) -DCH128P_XSCHOOL=0 $< -o $@
+build/128v2-test-schoolbook: test/128v2/test.c $(H128V2) | build
+	$(CC) $(CPPFLAGS) $(CFLAGS_128) $(ARCH_FLAGS) -DCH128P_XSCHOOL=1 $< -o $@
+build/128v2-test-noavx2: test/128v2/test.c $(H128V2) | build
+	$(CC) $(CPPFLAGS) $(CFLAGS_128) $(ARCH_FLAGS) -DCH128P_NO_AVX2 $< -o $@
+# schedule knobs (same digest): the pre-broadcast mask table on every CPU / never; no NEON next-region prefetch
+build/128v2-test-prebc: test/128v2/test.c $(H128V2) | build
+	$(CC) $(CPPFLAGS) $(CFLAGS_128) $(ARCH_FLAGS) -DCHAINHASH128V2_PREBC=1 $< -o $@
+build/128v2-test-noprebc: test/128v2/test.c $(H128V2) | build
+	$(CC) $(CPPFLAGS) $(CFLAGS_128) $(ARCH_FLAGS) -DCHAINHASH128V2_NO_PREBC $< -o $@
+build/128v2-test-nonpf: test/128v2/test.c $(H128V2) | build
+	$(CC) $(CPPFLAGS) $(CFLAGS_128) $(ARCH_FLAGS) -DCHAINHASH128V2_NO_NPF $< -o $@
+test-128v2: build/128v2-test build/128v2-test-noarch build/128v2-test-portable build/128v2-test-nonpf $(X86_TESTS_128V2) build/family-compile build/family-compile-portable build/family-cpp build/family-page
+	./build/family-compile
+	./build/family-compile-portable
+	./build/family-cpp
+	./build/family-page
+	./build/128v2-test $(RANDOM_CASES_V2)
+	./build/128v2-test-noarch 3000
+	./build/128v2-test-portable 3000
+	./build/128v2-test-nonpf 3000
+	for t in $(X86_TESTS_128V2); do ./$$t 3000 || exit 1; done
+	python3 test/128v2/check_vectors.py
+build/256-test: test/256/test.c $(H256) | build
+	$(CC) $(CPPFLAGS) $(CFLAGS_V2) $(ARCH_FLAGS) $(REF256) $< -o $@
+build/256-test-noarch: test/256/test.c $(H256) | build
+	$(CC) $(CPPFLAGS) $(CFLAGS_V2) $< -o $@
+build/256-test-portable: test/256/test.c $(H256) | build
+	$(CC) $(CPPFLAGS) $(CFLAGS_V2) -DCHAINHASH256_PORTABLE $< -o $@
+build/256-test-zen%: test/256/test.c $(H256) | build
+	$(CC) $(CPPFLAGS) $(CFLAGS_V2) $(ARCH_FLAGS) $(REF256) -DPHX_ZEN=$* $< -o $@
+# the fast finalizers on crafted twist-carry patterns; random raw keys with edge limbs, one-shot and streaming
+build/256-ftest: test/256/ftest.c $(H256) | build
+	$(CC) $(CPPFLAGS) $(CFLAGS_V2) $(ARCH_FLAGS) $(REF256) $< -o $@
+build/256-xcheck: test/256/xcheck.c $(H256) | build
+	$(CC) $(CPPFLAGS) $(CFLAGS_V2) $(ARCH_FLAGS) $(REF256) $< -o $@
+test-256: build/256-test build/256-test-noarch build/256-test-portable build/256-ftest build/256-xcheck $(X86_TESTS_256)
+	./build/256-test $(RANDOM_CASES_V2)
+	./build/256-test-noarch 200 50 300
+	./build/256-test-portable
+	./build/256-ftest
+	./build/256-xcheck
+	for t in $(X86_TESTS_256); do ./$$t 3000 500 || exit 1; done
+	python3 test/256/pyref.py test/256/vectors.txt 300000
+build/512-test: test/512/test.c $(H512) | build
+	$(CC) $(CPPFLAGS) $(CFLAGS_V2) $(ARCH_FLAGS) $< -o $@
+build/512-test-noarch: test/512/test.c $(H512) | build
+	$(CC) $(CPPFLAGS) $(CFLAGS_V2) $< -o $@
+build/512-test-portable: test/512/test.c $(H512) | build
+	$(CC) $(CPPFLAGS) $(CFLAGS_V2) -DCHAINHASH512_PORTABLE $< -o $@
+test-512: build/512-test build/512-test-noarch build/512-test-portable
+	./build/512-test 16000 100000
+	./build/512-test-noarch 3000 100000
+	./build/512-test-portable 200 60000
+	python3 test/512/pyref512.py | cmp - test/512/vectors.txt && echo "PASS Python oracle reproduces test/512/vectors.txt"
+# Every header as C++11 and C++17 (SMHasher harnesses are C++), alone and all together, with warnings as errors.
+CXX_HEADERS = chainhash.h chainhash128.h chainhash128v2.h chainhash256.h chainhash512.h
+CXX_STDS = c++11 c++17
+CXX_WERROR ?= -Werror
+cxx: test/family/cxx.c include/chainhash.h $(H128V2) $(H256) $(H512) | build
+	for std in $(CXX_STDS); do \
+	  for h in $(CXX_HEADERS); do \
+	    $(CXX) $(CPPFLAGS) -std=$$std -O2 -Wall -Wextra $(CXX_WERROR) $(ARCH_FLAGS) -x c++ -include $$h -c $< -o build/cxx.o || exit 1; \
+	  done; \
+	  $(CXX) $(CPPFLAGS) -std=$$std -O2 -Wall -Wextra $(CXX_WERROR) $(ARCH_FLAGS) -DCHAINHASH_ALL -x c++ -c $< -o build/cxx.o || exit 1; \
+	  $(CXX) $(CPPFLAGS) -std=$$std -O2 -Wall -Wextra $(CXX_WERROR) -DCHAINHASH_PORTABLE -DCHAINHASH128_PORTABLE -DCHAINHASH256_PORTABLE -DCHAINHASH512_PORTABLE -DCHAINHASH_ALL -x c++ -c $< -o build/cxx.o || exit 1; \
+	  echo "PASS C++ ($$std, $(CXX)): each header alone, all five together, native and portable"; \
+	done
+test-all: test test-128 cxx test-128v2 test-256 test-512
+# Machine-checked certificates behind docs/THEOREM-128v2.md, THEOREM-256.md and THEOREM-512.md.
+certs:
+	python3 test/128v2/cert128p.py
+	CC="$(CC)" sh test/256/certs.sh
+	python3 test/512/cert512.py
+
 # Regenerate the frozen vectors with the independent evaluators and compare them
 # with the archives. The archives are never overwritten.
 vectors: build/64-vectors build/64-vectors-portable build/128-vectors build/128-vectors-portable
 	python3 test/check_vectors.py
 	python3 test/128/check_vectors.py
+	python3 test/128v2/check_vectors.py --full
+	python3 test/256/pyref.py test/256/vectors.txt 300000
+	python3 test/512/pyref512.py | cmp - test/512/vectors.txt && echo "PASS Python oracle reproduces test/512/vectors.txt"
 
 # Print this CPU's calibrated schedules as C initializers (include/chainhash_calibrate.h).
 build/calibrate: test/calibrate.c include/chainhash_calibrate.h include/chainhash.h include/chainhash128.h | build
