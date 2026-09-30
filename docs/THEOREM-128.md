@@ -20,6 +20,9 @@ random bytes. Then
 Pr[ chainhash128(key, m) = chainhash128(key, m') ] <= min(1, (p(L) + d(L)) / 2^128).
 ```
 
+L counts 8-byte words: the bound is for messages of at most 8L bytes,
+so messages of up to n bytes use L = ⌈n/8⌉.
+
 The probability is over the key alone; the messages are chosen without
 seeing the key or any hash value (the guarantee is not adaptive, and the
 function is not a MAC). The event is equality of all 128 output bits;

@@ -17,6 +17,9 @@ independently of the key. The key is 64 uniformly random bytes. Then
 Pr[ chainhash(key, m) = chainhash(key, m') ] <= min(1, (p(L) + d(L)) / 2^64).
 ```
 
+L counts 8-byte words: the bound is for messages of at most 8L bytes,
+so messages of up to n bytes use L = ⌈n/8⌉.
+
 The probability is over the key alone; "fixed independently of the key"
 means the two messages are chosen without seeing the key or any hash
 value (the guarantee is not adaptive, and the function is not a MAC). The
