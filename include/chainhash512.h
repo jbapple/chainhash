@@ -187,21 +187,83 @@ PH1_TZ __attribute__((noinline)) static void ph1z_points(const ph512v1_key *k, c
         __m512i y=Z1X(_mm512_shuffle_i64x2(c,d,0x44),_mm512_shuffle_i64x2(c,d,0xEE));
         _mm512_storeu_si512((void*)&P[g],Z1X(_mm512_shuffle_i64x2(x,y,0x88),_mm512_shuffle_i64x2(x,y,0xDD))); }
 }
-/* ---- SSE4.1/PCLMUL 3-pass kernel: xmm = limb j of 2 pairs ---- */
+/* ---- SSE4.1/PCLMUL 3-pass kernel: xmm = limb j of 2 pairs ----
+ * nch full chunks -> 27 point sums, three passes per group of 8 chunks (pass 2 first: it reads the whole chunk;
+ * passes 0/1 prefetch the next group).
+ * Each step (chunk c, pair-pair d) forms the 8 operands a_j, b_j (limb 4w+j of pairs 2d, 2d+1 plus the key; pass 2:
+ * limb j + limb j+4 with the km key) and adds the 9 Karatsuba products of (a0..a3) x (b0..b3) to the pass's 9
+ * accumulators.  The schedule keeps the live set at 16 registers: A0..A6 in registers, A7/A8 in memory (VEX asm step),
+ * or nine register accumulators with the group-1 operands folded into the group-2 sums after they are loaded (C step). */
 #define X1X(a,b) _mm_xor_si128(a,b)
-#define X1ACC(A,a,b) A=X1X(A,X1X(_mm_clmulepi64_si128(a,b,0x00),_mm_clmulepi64_si128(a,b,0x11)))
-#define X1P2(A,i,a0,a1,b0,b1) do{ X1ACC(A[i],a0,b0); X1ACC(A[i+1],a1,b1); X1ACC(A[i+2],X1X(a0,a1),X1X(b0,b1)); }while(0)
-#define X1P4(A,a0,a1,a2,a3,b0,b1,b2,b3) do{ X1P2(A,0,a0,a1,b0,b1); X1P2(A,3,a2,a3,b2,b3); X1P2(A,6,X1X(a0,a2),X1X(a1,a3),X1X(b0,b2),X1X(b1,b3)); }while(0)
+#define X1C(A,a,b) do{ A=X1X(A,_mm_clmulepi64_si128(a,b,0x00)); A=X1X(A,_mm_clmulepi64_si128(a,b,0x11)); }while(0)
 #define X1LD(o) _mm_loadu_si128((const __m128i*)(q+(o)))
 #define X1K(kk) _mm_load_si128((const __m128i*)(kk))
+#define X1A(j) (w<2 ? X1X(X1LD(256*w+64*(j)+16*d),X1K(&k->kz_u[c][4*w+(j)][2*d])) : X1X(X1X(X1LD(64*(j)+16*d),X1LD(256+64*(j)+16*d)),X1K(&k->km_u[c][j][2*d])))
+#define X1B(j) (w<2 ? X1X(X1LD(512+256*w+64*(j)+16*d),X1K(&k->kz_v[c][4*w+(j)][2*d])) : X1X(X1X(X1LD(512+64*(j)+16*d),X1LD(768+64*(j)+16*d)),X1K(&k->km_v[c][j][2*d])))
+#if defined(__AVX__) && !defined(__AVX512VL__)
+/* The step as one asm block (AT&T, VEX): %[t0..t8] scratch, %[A0..A6] accumulators, %[M7] %[M8] memory accumulators,
+ * %[qa] the u data of the step (v at +512, limb j at +64 j, pass 2 adds limb j+4 at +256), %[ku] the u key (v at +8192
+ * for kz, +4096 for km).  With 16 registers and the compilers' own schedules gcc 9/11 spill 4-9 accumulators per step
+ * and clang 4; this order never spills.  EVEX builds (32 registers, vpternlog) do better with the C step below. */
+#define X1ASM_LD2(t,o) "vmovdqu " #o "(%[qa]),%[" #t "]\n\tvpxor " #o "(%[ku]),%[" #t "],%[" #t "]\n\t"
+#define X1ASM_LD2B(t,o) "vmovdqu 512+" #o "(%[qa]),%[" #t "]\n\tvpxor 8192+" #o "(%[ku]),%[" #t "],%[" #t "]\n\t"
+#define X1ASM_LD3(t,o) "vmovdqu " #o "(%[qa]),%[" #t "]\n\tvpxor " #o "+256(%[qa]),%[" #t "],%[" #t "]\n\tvpxor " #o "(%[ku]),%[" #t "],%[" #t "]\n\t"
+#define X1ASM_LD3B(t,o) "vmovdqu 512+" #o "(%[qa]),%[" #t "]\n\tvpxor 768+" #o "(%[qa]),%[" #t "],%[" #t "]\n\tvpxor 4096+" #o "(%[ku]),%[" #t "],%[" #t "]\n\t"
+#define X1ASM_X(a,b,d) "vpxor %[" #a "],%[" #b "],%[" #d "]\n\t"
+/* A += a b: lo and hi products into t8 and x, one dependent xor into A (x: a free scratch register) */
+#define X1ASM_MAC(A,a,b,x) "vpclmulqdq $0,%[" #b "],%[" #a "],%[t8]\n\tvpclmulqdq $17,%[" #b "],%[" #a "],%[" #x "]\n\tvpxor %[" #x "],%[t8],%[t8]\n\tvpxor %[t8],%[" #A "],%[" #A "]\n\t"
+/* the same with only t8 free (all eight operands live) */
+#define X1ASM_MAC1(A,a,b) "vpclmulqdq $0,%[" #b "],%[" #a "],%[t8]\n\tvpxor %[t8],%[" #A "],%[" #A "]\n\tvpclmulqdq $17,%[" #b "],%[" #a "],%[t8]\n\tvpxor %[t8],%[" #A "],%[" #A "]\n\t"
+/* memory accumulator M += a b */
+#define X1ASM_MACM(M,a,b,x) "vpclmulqdq $0,%[" #b "],%[" #a "],%[t8]\n\tvpclmulqdq $17,%[" #b "],%[" #a "],%[" #x "]\n\tvpxor %[" #x "],%[t8],%[t8]\n\tvpxor %[" #M "],%[t8],%[t8]\n\tvmovdqu %[t8],%[" #M "]\n\t"
+#define X1ASM_STEP(LD) \
+    LD(t0,0) LD##B(t1,0) X1ASM_MAC(A0,t0,t1,t2) \
+    LD(t2,64) LD##B(t3,64) X1ASM_MAC(A1,t2,t3,t4) \
+    X1ASM_X(t2,t0,t4) X1ASM_X(t3,t1,t5) X1ASM_MAC(A2,t4,t5,t6) \
+    LD(t6,128) LD##B(t7,128) X1ASM_X(t6,t0,t0) X1ASM_X(t7,t1,t1) X1ASM_MAC(A3,t6,t7,t4) \
+    LD(t4,192) LD##B(t5,192) X1ASM_X(t4,t2,t2) X1ASM_X(t5,t3,t3) X1ASM_MAC1(A4,t4,t5) \
+    X1ASM_X(t4,t6,t6) X1ASM_X(t5,t7,t7) X1ASM_MAC(A5,t6,t7,t4) \
+    X1ASM_MAC(A6,t0,t1,t4) X1ASM_MACM(M7,t2,t3,t4) \
+    X1ASM_X(t2,t0,t0) X1ASM_X(t3,t1,t1) X1ASM_MACM(M8,t0,t1,t4)
+#define X1ASM_OUT [A0]"+x"(A0),[A1]"+x"(A1),[A2]"+x"(A2),[A3]"+x"(A3),[A4]"+x"(A4),[A5]"+x"(A5),[A6]"+x"(A6),[M7]"+m"(M[7]),[M8]"+m"(M[8]), \
+    [t0]"=&x"(t0),[t1]"=&x"(t1),[t2]"=&x"(t2),[t3]"=&x"(t3),[t4]"=&x"(t4),[t5]"=&x"(t5),[t6]"=&x"(t6),[t7]"=&x"(t7),[t8]"=&x"(t8)
+#define X1ASM_IN [qa]"r"(qa),[ku]"r"(ku) : "memory"
+typedef char ph1x_asm_layout_check[(offsetof(ph512v1_key,kz_v)==offsetof(ph512v1_key,kz_u)+8192 && offsetof(ph512v1_key,km_v)==offsetof(ph512v1_key,km_u)+4096) ? 1 : -1];
+#endif
+/* one pass (w = 0, 1, 2) over chunks c0..c1: Aio[0..8] += the pass's 9 point sums; pf: the next group's data to prefetch */
+PH1_TX __attribute__((always_inline)) static inline void ph1x_pass(const ph512v1_key *k, const uint8_t *p, int c0, int c1, const int w, __m128i *Aio, const uint8_t *pf){
+    __m128i A0=Aio[0],A1=Aio[1],A2=Aio[2],A3=Aio[3],A4=Aio[4],A5=Aio[5],A6=Aio[6],A7=Aio[7],A8=Aio[8];
+#if defined(__AVX__) && !defined(__AVX512VL__)
+    __m128i M[9]; M[7]=A7; M[8]=A8;
+#endif
+    for(int c=c0;c<c1;c++){ const uint8_t *q=p+(size_t)c*PH1_CHUNK;
+        if(w<2 && pf){ const char *nx=(const char*)pf+(size_t)(c-c0)*PH1_CHUNK+512*w; for(int l=0;l<512;l+=64) _mm_prefetch(nx+l,_MM_HINT_T0); }
+        for(int d=0;d<4;d++){
+#if defined(__AVX__) && !defined(__AVX512VL__)
+            const uint8_t *qa = w<2 ? q+256*w+16*d : q+16*d;
+            const uint64_t *ku = w<2 ? &k->kz_u[c][4*w][2*d] : &k->km_u[c][0][2*d];
+            __m128i t0,t1,t2,t3,t4,t5,t6,t7,t8;
+            if(w<2) __asm__(X1ASM_STEP(X1ASM_LD2) : X1ASM_OUT : X1ASM_IN);
+            else    __asm__(X1ASM_STEP(X1ASM_LD3) : X1ASM_OUT : X1ASM_IN);
+#else
+            __m128i a0=X1A(0), b0=X1B(0); X1C(A0,a0,b0);
+            __m128i a1=X1A(1), b1=X1B(1); X1C(A1,a1,b1);
+            { __m128i s=X1X(a0,a1), t=X1X(b0,b1); X1C(A2,s,t); }
+            __m128i a2=X1A(2), a3=X1A(3), b2=X1B(2), b3=X1B(3);
+            a0=X1X(a0,a2); a1=X1X(a1,a3); b0=X1X(b0,b2); b1=X1X(b1,b3);
+            X1C(A3,a2,b2); X1C(A4,a3,b3); a2=X1X(a2,a3); b2=X1X(b2,b3); X1C(A5,a2,b2);
+            X1C(A6,a0,b0); X1C(A7,a1,b1); a0=X1X(a0,a1); b0=X1X(b0,b1); X1C(A8,a0,b0);
+#endif
+        } }
+#if defined(__AVX__) && !defined(__AVX512VL__)
+    A7=M[7]; A8=M[8];
+#endif
+    Aio[0]=A0; Aio[1]=A1; Aio[2]=A2; Aio[3]=A3; Aio[4]=A4; Aio[5]=A5; Aio[6]=A6; Aio[7]=A7; Aio[8]=A8;
+}
 PH1_TX __attribute__((noinline)) static void ph1x_points(const ph512v1_key *k, const uint8_t *p, int nch, ph1_u128 *P){
     __m128i A[27]; for(int i=0;i<27;i++) A[i]=_mm_setzero_si128();
-    for(int w=0;w<3;w++){ __m128i *Aw=A+9*w;
-        for(int c=0;c<nch;c++) for(int d=0;d<4;d++){ const uint8_t *q=p+(size_t)c*PH1_CHUNK+16*d; int o=2*d; __m128i a[4],b[4];
-            for(int j=0;j<4;j++){
-                if(w<2){ a[j]=X1X(X1LD(256*w+64*j),X1K(&k->kz_u[c][4*w+j][o])); b[j]=X1X(X1LD(512+256*w+64*j),X1K(&k->kz_v[c][4*w+j][o])); }
-                else { a[j]=X1X(X1X(X1LD(64*j),X1LD(256+64*j)),X1K(&k->km_u[c][j][o])); b[j]=X1X(X1X(X1LD(512+64*j),X1LD(768+64*j)),X1K(&k->km_v[c][j][o])); } }
-            X1P4(Aw,a[0],a[1],a[2],a[3],b[0],b[1],b[2],b[3]); } }
+    for(int s=0;s<nch;s+=8){ int e=s+8<nch?s+8:nch; const uint8_t *pf = e<nch ? p+(size_t)e*PH1_CHUNK : 0;
+        ph1x_pass(k,p,s,e,2,A+18,pf); ph1x_pass(k,p,s,e,0,A,pf); ph1x_pass(k,p,s,e,1,A+9,pf); }
     for(int i=0;i<27;i++) _mm_storeu_si128((__m128i*)&P[i],A[i]);
 }
 /* ---- 128-bit primitives (SSE) for the body ---- */
